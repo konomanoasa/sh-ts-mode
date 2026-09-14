@@ -669,8 +669,10 @@
 
 (defconst sh-ts-mode-indent-rules
   '((sh
-     ((node-is "}") standalone-parent 0)
-     ((node-is ")") standalone-parent 0)
+     ((and (node-is "}") (parent-is "brace_group")) standalone-parent 0)
+     ((and (node-is ")")
+           (or (parent-is "subshell") (parent-is "command_substitution")))
+      standalone-parent 0)
      ((node-is "then_keyword") parent-bol 0)
      ((node-is "else_part") parent-bol 0)
      ((node-is "fi_keyword") parent-bol 0)
