@@ -42,7 +42,7 @@
 
 (defconst sh-ts-mode--grammar-sources
   '((sh "https://github.com/konomanoasa/tree-sitter-sh"
-        :revision "v0.7.0"))
+        :revision "v0.14.0"))
   "Tree-sitter grammar sources for POSIX sh.")
 
 ;;;; Context
@@ -66,8 +66,20 @@
 
 (defconst sh-ts-mode--pattern-scope-types
   (append sh-ts-mode--pattern-context-types
-          sh-ts-mode--pattern-boundary-types)
+          sh-ts-mode--pattern-boundary-types
+          '("tilde_expansion"))
   "Node types whose nested patterns belong to another pattern scope.")
+
+(defun sh-ts-mode--continued-lexical-token-p (node)
+  "Return non-nil when NODE's parent has only continuation leaves."
+  (let* ((parent (treesit-node-parent node))
+         (index 0)
+         (count (treesit-node-child-count parent)))
+    (while (and (< index count)
+                (equal (treesit-node-type (treesit-node-child parent index))
+                       "\\"))
+      (setq index (1+ index)))
+    (= index count)))
 
 (defun sh-ts-mode--ancestor-state (node inside-types outside-types)
   "Return whether NODE enters INSIDE-TYPES before OUTSIDE-TYPES."
@@ -135,12 +147,48 @@
   "Return non-nil when NODE is outside every shell pattern."
   (not (sh-ts-mode--pattern-interior-p node)))
 
-(defun sh-ts-mode--plain-literal-p (node)
-  "Return non-nil when NODE is a plain literal."
+(defun sh-ts-mode--pattern-source-owner (node)
+  "Return the owner outside the pattern source structure of NODE."
+  (let ((parent (treesit-node-parent node)))
+    (while (and parent
+                (member (treesit-node-type parent)
+                        '("pattern_bracket_source"
+                          "pattern_bracket_negation_source"
+                          "pattern_bracket_members_source"
+                          "pattern_bracket_range_source"
+                          "pattern_character_class_source"
+                          "pattern_collating_symbol_source"
+                          "pattern_equivalence_class_source")))
+      (setq parent (treesit-node-parent parent)))
+    parent))
+
+(defun sh-ts-mode--tilde-pattern-source-p (node)
+  "Return non-nil when NODE is pattern source owned by a tilde prefix."
+  (let ((owner (sh-ts-mode--pattern-source-owner node)))
+    (and owner (equal (treesit-node-type owner) "tilde_user"))))
+
+(defun sh-ts-mode--plain-pattern-source-p (node)
+  "Return non-nil when NODE is pattern source treated as plain text."
+  (let* ((owner (sh-ts-mode--pattern-source-owner node))
+         (type (and owner (treesit-node-type owner)))
+         (parent (and owner (treesit-node-parent owner))))
+    (and (not (equal type "tilde_user"))
+         (not (member type sh-ts-mode--pattern-context-types))
+         (not (and (equal type "word") parent
+                   (member (treesit-node-type parent)
+                           sh-ts-mode--pathname-owner-types)))
+         (sh-ts-mode--outside-pattern-interior-p owner))))
+
+(defun sh-ts-mode--shell-pattern-source-p (node)
+  "Return non-nil when NODE is pattern source outside a tilde prefix."
+  (and (sh-ts-mode--pattern-interior-p node)
+       (not (sh-ts-mode--tilde-pattern-source-p node))))
+
+(defun sh-ts-mode--string-literal-p (node)
+  "Return non-nil when NODE has a string literal owner."
   (let* ((parent (treesit-node-parent node))
          (owner (and parent (treesit-node-parent parent))))
-    (and (sh-ts-mode--outside-pattern-interior-p node)
-         (not (and parent
+    (and (not (and parent
                    (equal (treesit-node-type parent) "tilde_user")))
          (not (and parent owner
                    (equal (treesit-node-type parent) "word")
@@ -187,27 +235,6 @@
                 ["(" ")"] @delimiter))
              t))))
 
-(defun sh-ts-mode-syntax--captures (parser &optional start end)
-  "Return syntax captures from PARSER between START and END."
-  (with-current-buffer (treesit-parser-buffer parser)
-    (save-restriction
-      (widen)
-      (let ((start (or start (point-min)))
-            (end (or end (point-max)))
-            (query (sh-ts-mode-syntax--query))
-            captures)
-        (dolist (capture
-                 (treesit-query-capture
-                  (treesit-parser-root-node parser)
-                  query start end))
-          (let ((node (cdr capture)))
-            (push (list (car capture)
-                        (treesit-node-start node)
-                        (treesit-node-end node))
-                  captures)))
-        (sort captures
-              (lambda (left right) (< (nth 1 left) (nth 1 right))))))))
-
 ;;;;; Propertization
 
 (defun sh-ts-mode-syntax--delimiter-syntax (position)
@@ -228,16 +255,23 @@
         (remove-text-properties (point-min) start '(syntax-table nil))
         (setq start (point-min))
         (syntax-ppss-flush-cache start))
-      (dolist (capture (sh-ts-mode-syntax--captures
-                        treesit-primary-parser start end))
+      (dolist (capture (treesit-query-capture
+                        (treesit-parser-root-node treesit-primary-parser)
+                        (sh-ts-mode-syntax--query) start end))
         (let* ((name (car capture))
+               (node (cdr capture))
                (position (if (eq name 'comment)
-                             (nth 1 capture)
-                           (1- (nth 2 capture)))))
-          (put-text-property
-           position (1+ position) 'syntax-table
-           (if (eq name 'comment)
-               (string-to-syntax "<")
+                             (treesit-node-start node)
+                           (1- (treesit-node-end node)))))
+          (if (eq name 'comment)
+              (let ((end (treesit-node-end node)))
+                (put-text-property position (1+ position) 'syntax-table
+                                   (string-to-syntax "< b"))
+                (when (< end (point-max))
+                  (put-text-property end (1+ end) 'syntax-table
+                                     (string-to-syntax "> b"))))
+            (put-text-property
+             position (1+ position) 'syntax-table
              (sh-ts-mode-syntax--delimiter-syntax position))))))))
 
 ;;;;; Setup
@@ -266,13 +300,31 @@
 
 ;;;;; Settings
 
+(defun sh-ts-mode-font-lock--pattern-source-query (face predicate &optional scope)
+  "Return leaf queries using FACE when PREDICATE and SCOPE match."
+  (mapcar
+   (lambda (pattern)
+     (append (list pattern (list :pred predicate face))
+             (when scope (list (list :pred scope face)))))
+   `(([(pattern_star_source) (pattern_question_source)
+       (pattern_bracket_character_source) (pattern_bracket_hyphen_source)
+       (pattern_bracket_range_operator_source)
+       (pattern_character_class_content_source)
+       (pattern_collating_symbol_character_source)
+       (pattern_equivalence_class_character_source)] ,face)
+     (pattern_bracket_source ["[" "]"] ,face)
+     ((pattern_bracket_negation_source) ,face)
+     (pattern_character_class_source ["[" ":" "]"] ,face)
+     (pattern_collating_symbol_source ["[" "." "]"] ,face)
+     (pattern_equivalence_class_source ["[" "=" "]"] ,face))))
+
 (defun sh-ts-mode-font-lock--settings ()
   "Return the font-lock settings."
   (treesit-font-lock-rules
    :default-language 'sh
 
    :feature 'comment
-   '((comment) @font-lock-comment-face)
+   '((comment_text) @font-lock-comment-face)
 
    :feature 'keyword
    '([(case_keyword)
@@ -307,8 +359,8 @@
 
    :feature 'string
    '(((literal) @font-lock-string-face
-      (:pred sh-ts-mode--plain-literal-p
-             @font-lock-string-face))
+      (:pred sh-ts-mode--string-literal-p @font-lock-string-face)
+      (:pred sh-ts-mode--outside-pattern-interior-p @font-lock-string-face))
      ((single_quoted
        "'" @font-lock-string-face)
       (:pred sh-ts-mode--outside-pattern-interior-p
@@ -318,7 +370,7 @@
       (:pred sh-ts-mode--outside-pattern-interior-p
              @font-lock-string-face))
      ((dollar_single_quoted
-       ["$'" "'"] @font-lock-string-face)
+       ["$" "'"] @font-lock-string-face)
       (:pred sh-ts-mode--outside-pattern-interior-p
              @font-lock-string-face))
      ((backquote_substitution
@@ -332,12 +384,21 @@
        (quoted_here_document_text)] @font-lock-string-face
       (:pred sh-ts-mode--outside-pattern-interior-p
              @font-lock-string-face))
-     (here_document_end) @font-lock-string-face)
+     (here_document_end_text) @font-lock-string-face)
+
+   :feature 'string
+   (sh-ts-mode-font-lock--pattern-source-query
+    '@font-lock-string-face #'sh-ts-mode--plain-pattern-source-p)
 
    :feature 'number
    '(([(arithmetic_number) (io_number)] @font-lock-number-face
       (:pred sh-ts-mode--outside-pattern-interior-p
              @font-lock-number-face)))
+
+   :feature 'constant
+   (sh-ts-mode-font-lock--pattern-source-query
+    '@font-lock-constant-face #'sh-ts-mode--tilde-pattern-source-p
+    #'sh-ts-mode--outside-pattern-interior-p)
 
    :feature 'constant
    '(((parameter_expansion
@@ -388,6 +449,11 @@
              @font-lock-escape-face)))
 
    :feature 'pattern
+   (sh-ts-mode-font-lock--pattern-source-query
+    '@font-lock-constant-face #'sh-ts-mode--tilde-pattern-source-p
+    #'sh-ts-mode--pattern-interior-p)
+
+   :feature 'pattern
    '(([(pattern_bracket_character_source)
        (pattern_bracket_hyphen_source)
        (pattern_character_class_content_source)
@@ -395,39 +461,43 @@
        (pattern_equivalence_class_character_source)
        (pattern_question_source)
        (pattern_star_source)] @font-lock-constant-face
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-constant-face))
+      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-constant-face))
      ((pattern_bracket_source
        ["[" "]"] @font-lock-bracket-face)
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-bracket-face))
-     ((pattern_bracket_negation_source
-       "!" @font-lock-negation-char-face)
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-negation-char-face))
+      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-bracket-face))
+     ((pattern_bracket_negation_source) @font-lock-negation-char-face
+      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-negation-char-face))
      ((pattern_bracket_range_operator_source) @font-lock-operator-face
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-operator-face))
+      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-operator-face))
      ((pattern_character_class_source
        ["[" "]"] @font-lock-bracket-face)
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-bracket-face))
+      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-bracket-face))
      ((pattern_character_class_source
        ":" @font-lock-punctuation-face)
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-punctuation-face))
+      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-punctuation-face))
      ((pattern_collating_symbol_source
        ["[" "]"] @font-lock-bracket-face)
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-bracket-face))
+      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-bracket-face))
      ((pattern_collating_symbol_source
        "." @font-lock-punctuation-face)
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-punctuation-face))
+      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-punctuation-face))
      ((pattern_equivalence_class_source
        ["[" "]"] @font-lock-bracket-face)
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-bracket-face))
+      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-bracket-face))
      ((pattern_equivalence_class_source
        "=" @font-lock-punctuation-face)
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-punctuation-face))
+      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-punctuation-face))
      ((pattern_list
        "|" @font-lock-operator-face)
       (:pred sh-ts-mode--pattern-interior-p @font-lock-operator-face)))
 
    :feature 'pattern
-   '(((literal) @font-lock-string-face
+   '(((cmd_name (word (literal) @font-lock-function-call-face))
+      (:pred sh-ts-mode--pattern-interior-p @font-lock-function-call-face))
+     ((cmd_word (word (literal) @font-lock-function-call-face))
+      (:pred sh-ts-mode--pattern-interior-p @font-lock-function-call-face))
+     ((literal) @font-lock-string-face
+      (:pred sh-ts-mode--string-literal-p @font-lock-string-face)
       (:pred sh-ts-mode--pattern-interior-p @font-lock-string-face))
      ((single_quoted
        "'" @font-lock-string-face)
@@ -436,7 +506,7 @@
        "\"" @font-lock-string-face)
       (:pred sh-ts-mode--pattern-interior-p @font-lock-string-face))
      ((dollar_single_quoted
-       ["$'" "'"] @font-lock-string-face)
+       ["$" "'"] @font-lock-string-face)
       (:pred sh-ts-mode--pattern-interior-p @font-lock-string-face))
      ((backquote_substitution
        "`" @font-lock-string-face)
@@ -509,7 +579,7 @@
       ";" @font-lock-punctuation-face)
      (sequential_sep
       ";" @font-lock-punctuation-face)
-     (line_continuation) @font-lock-punctuation-face
+     "\\" @font-lock-punctuation-face
      (command_substitution
       "$" @font-lock-punctuation-face)
      (arithmetic_expansion
@@ -539,7 +609,13 @@
      (parenthesized_arithmetic_source
       ["(" ")"] @font-lock-bracket-face)
      (parenthesized_arithmetic_dynamic_source
-      ["(" ")"] @font-lock-bracket-face))))
+      ["(" ")"] @font-lock-bracket-face))
+
+   :feature 'punctuation
+   :override t
+   '(("\\" @font-lock-punctuation-face
+      (:pred sh-ts-mode--continued-lexical-token-p
+             @font-lock-punctuation-face)))))
 
 ;;;;; Setup
 
@@ -568,7 +644,7 @@
 ;;;; Imenu
 
 (defconst sh-ts-mode-imenu-settings
-  `((nil ,sh-ts-mode--function-definition-regexp nil nil))
+  `(("Function" ,sh-ts-mode--function-definition-regexp nil nil))
   "Tree-sitter Imenu settings for POSIX sh.")
 
 (defun sh-ts-mode--defun-name (node)
@@ -626,12 +702,12 @@
              treesit-language-source-alist
            (cons (assq language sh-ts-mode--grammar-sources)
                  treesit-language-source-alist))))
-    (treesit-ensure-installed language)))
+    (or (treesit-ensure-installed language)
+        (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
 (defun sh-ts-mode--setup ()
   "Configure `sh-ts-mode' in the current buffer."
-  (unless (sh-ts-mode--ensure-grammar 'sh)
-    (user-error "Tree-sitter grammar `sh' is unavailable"))
+  (sh-ts-mode--ensure-grammar 'sh)
   (setq-local treesit-primary-parser (treesit-parser-create 'sh))
   (sh-ts-mode-syntax-setup)
   (sh-ts-mode-font-lock-setup)

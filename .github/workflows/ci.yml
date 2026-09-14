@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
 
 permissions:
   contents: read
@@ -37,7 +38,8 @@ jobs:
             | shasum -a 256 --check
           tar -xf "$archive" -C "$source_directory" --strip-components=1
           cd "$source_directory"
-          export PKG_CONFIG_PATH="$(brew --prefix tree-sitter)/lib/pkgconfig:$(brew --prefix gnutls)/lib/pkgconfig"
+          PKG_CONFIG_PATH="$(brew --prefix tree-sitter)/lib/pkgconfig:$(brew --prefix gnutls)/lib/pkgconfig"
+          export PKG_CONFIG_PATH
           ./configure \
             --prefix="$HOME/.local/emacs-31.1" \
             --without-dbus \
