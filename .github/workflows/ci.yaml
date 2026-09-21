@@ -80,7 +80,7 @@ jobs:
           "$emacs" -Q --batch -L . \
             --eval "(setq user-emacs-directory \"$RUNNER_TEMP/emacs.d/\")" \
             -l sh-ts-mode \
-            --eval '(let ((treesit-auto-install-grammar (quote always))) (dolist (language (quote (sh))) (unless (sh-ts-mode--ensure-grammar language) (error "Cannot install the %s grammar" language))))'
+            --eval '(let ((treesit-auto-install-grammar (quote always))) (dolist (source sh-ts-mode--grammar-sources) (sh-ts-mode--ensure-grammar (car source))))'
           "$emacs" -Q --batch -L . -L test \
             --eval "(setq user-emacs-directory \"$RUNNER_TEMP/emacs.d/\")" \
             -l test/sh-ts-mode-test.el \

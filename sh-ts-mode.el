@@ -42,7 +42,7 @@
 
 (defconst sh-ts-mode--grammar-sources
   '((sh "https://github.com/konomanoasa/tree-sitter-sh"
-        :revision "v0.14.0"))
+        :revision "v0.16.0"))
   "Tree-sitter grammar sources for POSIX sh.")
 
 ;;;; Context
@@ -77,12 +77,12 @@
          (count (treesit-node-child-count parent)))
     (while (and (< index count)
                 (equal (treesit-node-type (treesit-node-child parent index))
-                       "\\"))
+                       "line_continuation"))
       (setq index (1+ index)))
     (= index count)))
 
 (defun sh-ts-mode--ancestor-state (node inside-types outside-types)
-  "Return whether NODE enters INSIDE-TYPES before OUTSIDE-TYPES."
+  "Return non-nil when NODE enters INSIDE-TYPES before OUTSIDE-TYPES."
   (let (state)
     (while (and node (not state))
       (let ((type (treesit-node-type node)))
@@ -93,7 +93,7 @@
     (eq state 'inside)))
 
 (defun sh-ts-mode--active-pattern-p (node)
-  "Return non-nil when NODE is in an active shell pattern."
+  "Return non-nil when NODE is inside an active shell pattern."
   (sh-ts-mode--ancestor-state
    node sh-ts-mode--pattern-context-types
    sh-ts-mode--pattern-boundary-types))
@@ -205,40 +205,34 @@
     table)
   "Syntax table for `sh-ts-mode'.")
 
-(defvar sh-ts-mode-syntax--query-cache nil
-  "Cached syntax query.")
-
 ;;;;; Syntax Queries
 
-(defun sh-ts-mode-syntax--query ()
-  "Return the cached syntax query."
-  (or sh-ts-mode-syntax--query-cache
-      (setq sh-ts-mode-syntax--query-cache
-            (treesit-query-compile
-             'sh
-             '((comment) @comment
-               (parameter_expansion ["{" "}"] @delimiter)
-               (command_substitution ["(" ")"] @delimiter)
-               (arithmetic_expansion ["(" ")"] @delimiter)
-               (function_definition ["(" ")"] @delimiter)
-               (case_item
-                patterns: (pattern_list "(" @delimiter)
-                ")" @delimiter)
-               (case_item_ns
-                patterns: (pattern_list "(" @delimiter)
-                ")" @delimiter)
-               (brace_group ["{" "}"] @delimiter)
-               (subshell ["(" ")"] @delimiter)
-               (parenthesized_arithmetic ["(" ")"] @delimiter)
-               (parenthesized_arithmetic_source ["(" ")"] @delimiter)
-               (parenthesized_arithmetic_dynamic_source
-                ["(" ")"] @delimiter))
-             t))))
+(defconst sh-ts-mode-syntax--query
+  (treesit-query-compile
+   'sh
+   '((comment) @comment
+     (parameter_expansion ["{" "}"] @delimiter)
+     (command_substitution ["(" ")"] @delimiter)
+     (arithmetic_expansion ["(" ")"] @delimiter)
+     (function_definition ["(" ")"] @delimiter)
+     (case_item
+      patterns: (pattern_list "(" @delimiter)
+      ")" @delimiter)
+     (case_item_ns
+      patterns: (pattern_list "(" @delimiter)
+      ")" @delimiter)
+     (brace_group ["{" "}"] @delimiter)
+     (subshell ["(" ")"] @delimiter)
+     (parenthesized_arithmetic ["(" ")"] @delimiter)
+     (parenthesized_arithmetic_source ["(" ")"] @delimiter)
+     (parenthesized_arithmetic_dynamic_source
+      ["(" ")"] @delimiter)))
+  "Compiled syntax query for POSIX sh.")
 
 ;;;;; Propertization
 
 (defun sh-ts-mode-syntax--delimiter-syntax (position)
-  "Return syntax-table syntax for the delimiter at POSITION."
+  "Return the syntax descriptor for the delimiter at POSITION."
   (pcase (char-after position)
     (?\( (string-to-syntax "()"))
     (?\) (string-to-syntax ")("))
@@ -257,7 +251,7 @@
         (syntax-ppss-flush-cache start))
       (dolist (capture (treesit-query-capture
                         (treesit-parser-root-node treesit-primary-parser)
-                        (sh-ts-mode-syntax--query) start end))
+                        sh-ts-mode-syntax--query start end))
         (let* ((name (car capture))
                (node (cdr capture))
                (position (if (eq name 'comment)
@@ -319,7 +313,7 @@
      (pattern_equivalence_class_source ["[" "=" "]"] ,face))))
 
 (defun sh-ts-mode-font-lock--settings ()
-  "Return the font-lock settings."
+  "Return font-lock settings for the current buffer."
   (treesit-font-lock-rules
    :default-language 'sh
 
@@ -382,8 +376,8 @@
        (dollar_single_quote_text)
        (here_document_text)
        (quoted_here_document_text)] @font-lock-string-face
-      (:pred sh-ts-mode--outside-pattern-interior-p
-             @font-lock-string-face))
+       (:pred sh-ts-mode--outside-pattern-interior-p
+              @font-lock-string-face))
      (here_document_end_text) @font-lock-string-face)
 
    :feature 'string
@@ -412,7 +406,7 @@
              @font-lock-constant-face))
      ((tilde_expansion
        user: (tilde_user
-         (literal) @font-lock-constant-face))
+              (literal) @font-lock-constant-face))
       (:pred sh-ts-mode--outside-pattern-interior-p
              @font-lock-constant-face)))
 
@@ -445,8 +439,8 @@
        (dollar_single_quote_escape)
        (double_quote_escape)
        (here_document_escape)] @font-lock-escape-face
-      (:pred sh-ts-mode--outside-pattern-interior-p
-             @font-lock-escape-face)))
+       (:pred sh-ts-mode--outside-pattern-interior-p
+              @font-lock-escape-face)))
 
    :feature 'pattern
    (sh-ts-mode-font-lock--pattern-source-query
@@ -461,7 +455,7 @@
        (pattern_equivalence_class_character_source)
        (pattern_question_source)
        (pattern_star_source)] @font-lock-constant-face
-      (:pred sh-ts-mode--shell-pattern-source-p @font-lock-constant-face))
+       (:pred sh-ts-mode--shell-pattern-source-p @font-lock-constant-face))
      ((pattern_bracket_source
        ["[" "]"] @font-lock-bracket-face)
       (:pred sh-ts-mode--shell-pattern-source-p @font-lock-bracket-face))
@@ -514,13 +508,13 @@
      ([(single_quote_content)
        (double_quote_text)
        (dollar_single_quote_text)] @font-lock-string-face
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-string-face))
+       (:pred sh-ts-mode--pattern-interior-p @font-lock-string-face))
      ((tilde_expansion
        "~" @font-lock-constant-face)
       (:pred sh-ts-mode--pattern-interior-p @font-lock-constant-face))
      ((tilde_expansion
        user: (tilde_user
-         (literal) @font-lock-constant-face))
+              (literal) @font-lock-constant-face))
       (:pred sh-ts-mode--pattern-interior-p @font-lock-constant-face))
      ([(arithmetic_number) (io_number)] @font-lock-number-face
       (:pred sh-ts-mode--pattern-interior-p @font-lock-number-face))
@@ -546,7 +540,7 @@
        (dollar_single_quote_escape)
        (double_quote_escape)
        (here_document_escape)] @font-lock-escape-face
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-escape-face)))
+       (:pred sh-ts-mode--pattern-interior-p @font-lock-escape-face)))
 
    :feature 'operator
    '((assignment_word
@@ -579,7 +573,7 @@
       ";" @font-lock-punctuation-face)
      (sequential_sep
       ";" @font-lock-punctuation-face)
-     "\\" @font-lock-punctuation-face
+     (line_continuation) @font-lock-punctuation-face
      (command_substitution
       "$" @font-lock-punctuation-face)
      (arithmetic_expansion
@@ -613,14 +607,14 @@
 
    :feature 'punctuation
    :override t
-   '(("\\" @font-lock-punctuation-face
+   '(((line_continuation) @font-lock-punctuation-face
       (:pred sh-ts-mode--continued-lexical-token-p
              @font-lock-punctuation-face)))))
 
 ;;;;; Setup
 
 (defun sh-ts-mode-font-lock-setup ()
-  "Configure font locking for the current buffer."
+  "Configure font lock for the current buffer."
   (setq-local treesit-font-lock-feature-list
               sh-ts-mode-font-lock--feature-list)
   (setq-local treesit-font-lock-settings
@@ -639,7 +633,8 @@
 
 (defun sh-ts-mode-navigation-setup ()
   "Configure navigation for the current buffer."
-  (setq-local treesit-thing-settings sh-ts-mode-thing-settings))
+  (setq-local treesit-thing-settings
+              sh-ts-mode-thing-settings))
 
 ;;;; Imenu
 
@@ -648,7 +643,7 @@
   "Tree-sitter Imenu settings for POSIX sh.")
 
 (defun sh-ts-mode--defun-name (node)
-  "Return the name of the function definition NODE."
+  "Return the source name of NODE, or nil if it has no name."
   (when (treesit-node-match-p
          node sh-ts-mode--function-definition-regexp)
     (let ((name (treesit-node-child-by-field-name node "name")))
@@ -657,8 +652,10 @@
 
 (defun sh-ts-mode-imenu-setup ()
   "Configure Imenu for the current buffer."
-  (setq-local treesit-defun-name-function #'sh-ts-mode--defun-name)
-  (setq-local treesit-simple-imenu-settings sh-ts-mode-imenu-settings))
+  (setq-local treesit-defun-name-function
+              #'sh-ts-mode--defun-name)
+  (setq-local treesit-simple-imenu-settings
+              sh-ts-mode-imenu-settings))
 
 ;;;; Indentation
 

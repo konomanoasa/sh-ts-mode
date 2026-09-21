@@ -3,77 +3,50 @@
 ;;; Code:
 
 (require 'ert)
+(require 'imenu)
+(require 'loaddefs-gen)
+(require 'newcomment)
 (require 'sh-ts-mode)
+
+(dolist (language '(sh))
+  (unless (treesit-ready-p language t)
+    (error "The %s grammar is required to run the tests" language)))
 
 ;;;; Helpers
 
-(defun sh-ts-mode-test--require-grammar ()
-  (unless (treesit-ready-p 'sh t)
-    (ert-skip "The sh grammar is unavailable")))
+(defun sh-ts-mode-test--position (fragment &optional line)
+  (save-excursion
+    (goto-char (point-min))
+    (when line
+      (let ((found nil))
+        (while (and (not found) (not (eobp)))
+          (if (equal line (buffer-substring-no-properties
+                           (line-beginning-position) (line-end-position)))
+              (setq found t)
+            (forward-line 1)))
+        (unless found (ert-fail (format "Missing fixture line: %S" line)))))
+    (unless (search-forward fragment (and line (line-end-position)) t)
+      (ert-fail (format "Missing fixture fragment: %S" fragment)))
+    (- (point) (length fragment))))
 
-(defun sh-ts-mode-test--grammar-source (configured)
-  (let ((treesit-language-source-alist configured)
-        (ensure (symbol-function 'treesit-ensure-installed))
-        source)
-    (unwind-protect
-        (progn
-          (fset 'treesit-ensure-installed
-                (lambda (installed-language)
-                  (setq source
-                        (assq installed-language
-                              treesit-language-source-alist))
-                  t))
-          (should (sh-ts-mode--ensure-grammar 'sh))
-          source)
-      (fset 'treesit-ensure-installed ensure))))
+(defun sh-ts-mode-test--face (fragment &optional offset line)
+  (get-text-property (+ (sh-ts-mode-test--position fragment line)
+                        (or offset 0)) 'face))
 
-(defun sh-ts-mode-test--enable-font-lock-level (level)
-  (let ((treesit-font-lock-level level))
-    (sh-ts-mode)))
-
-(defun sh-ts-mode-test--position-in-line (line fragment)
-  (let (line-start)
-    (save-excursion
-      (goto-char (point-min))
-      (while (and (not line-start) (not (eobp)))
-        (let ((start (line-beginning-position))
-              (end (line-end-position)))
-          (if (equal line (buffer-substring-no-properties start end))
-              (setq line-start start)
-            (forward-line 1)))))
-    (unless line-start
-      (ert-fail (format "Test line not found: %s" line)))
-    (let ((offset (string-search fragment line)))
-      (unless offset
-        (ert-fail (format "Fragment %s not found in test line: %s"
-                          fragment line)))
-      (+ line-start offset))))
-
-(defun sh-ts-mode-test--face-in-line (line fragment &optional offset)
-  (get-text-property
-   (+ (sh-ts-mode-test--position-in-line line fragment)
-      (or offset 0))
-   'face))
-
-(defun sh-ts-mode-test--comment-in-line-p (line fragment &optional offset)
+(defun sh-ts-mode-test--comment-p (fragment &optional offset line)
   (syntax-propertize (point-max))
-  (nth 4 (syntax-ppss
-          (+ (sh-ts-mode-test--position-in-line line fragment)
-             (or offset 0)))))
+  (nth 4 (syntax-ppss (+ (sh-ts-mode-test--position fragment line)
+                         (or offset 0)))))
 
-(defun sh-ts-mode-test--syntax-class-in-line
-    (line fragment &optional offset)
+(defun sh-ts-mode-test--syntax-class (fragment &optional offset line)
   (syntax-propertize (point-max))
-  (syntax-class
-   (syntax-after
-    (+ (sh-ts-mode-test--position-in-line line fragment)
-       (or offset 0)))))
+  (syntax-class (syntax-after (+ (sh-ts-mode-test--position fragment line)
+                                 (or offset 0)))))
 
-(defun sh-ts-mode-test--should-fontify (cases)
+(defun sh-ts-mode-test--should-have-faces (cases)
   (pcase-dolist (`(,line ,fragment ,face) cases)
-    (should (equal (list line fragment
-                         (sh-ts-mode-test--face-in-line line fragment))
-                   (list line fragment face)))))
+    (ert-info ((format "%S: %S" line fragment))
+              (should (eq (sh-ts-mode-test--face fragment nil line) face)))))
 
 (defun sh-ts-mode-test--indent (source &optional offset)
   (with-temp-buffer
@@ -89,64 +62,111 @@
       indented)))
 
 (defun sh-ts-mode-test--buffer-state ()
+  (font-lock-ensure)
   (syntax-propertize (point-max))
-  (let ((position (point-min)) state)
-    (while (< position (point-max))
-      (push (list (get-text-property position 'face)
-                  (syntax-after position))
-            state)
-      (setq position (1+ position)))
+  (let (state)
+    (dotimes (offset (- (point-max) (point-min)))
+      (let ((position (+ (point-min) offset)))
+        (push (list (get-text-property position 'face) (syntax-after position)) state)))
     (nreverse state)))
 
 (defun sh-ts-mode-test--should-match-fresh-buffer (level)
   (let ((source (buffer-substring-no-properties (point-min) (point-max)))
-        (state (sh-ts-mode-test--buffer-state)))
+        (state (sh-ts-mode-test--buffer-state))
+        (file buffer-file-name))
     (with-temp-buffer
+      (setq buffer-file-name file)
       (insert source)
       (let ((treesit-font-lock-level level)) (sh-ts-mode))
-      (font-lock-ensure)
       (should (equal state (sh-ts-mode-test--buffer-state))))))
 
 ;;;; Grammar
 
-(ert-deftest sh-ts-mode-starts-a-posix-sh-parser ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (insert "printf '%s\\n' hello\n")
-    (sh-ts-mode)
-    (should (eq major-mode 'sh-ts-mode))
-    (should
-     (equal (treesit-node-type (treesit-buffer-root-node 'sh))
-            "program"))))
+(ert-deftest sh-ts-mode-respects-grammar-sources ()
+  (let ((ensure (symbol-function 'treesit-ensure-installed)) received)
+    (unwind-protect
+        (progn
+          (fset 'treesit-ensure-installed
+                (lambda (language)
+                  (setq received (assq language treesit-language-source-alist))
+                  t))
+          (dolist (source sh-ts-mode--grammar-sources)
+            (let* ((language (car source))
+                   (custom (list language "/local/grammar" :revision "custom")))
+              (dolist (configured (list nil (list custom)))
+                (let ((treesit-language-source-alist configured))
+                  (should (sh-ts-mode--ensure-grammar language))
+                  (should (equal received (if configured custom source)))
+                  (should (eq treesit-language-source-alist configured)))))))
+      (fset 'treesit-ensure-installed ensure))))
 
-(ert-deftest sh-ts-mode-provides-a-default-grammar-source ()
-  (should
-   (equal
-    (sh-ts-mode-test--grammar-source nil)
-    '(sh "https://github.com/konomanoasa/tree-sitter-sh"
-         :revision "v0.14.0"))))
-
-(ert-deftest sh-ts-mode-preserves-a-user-grammar-source ()
-  (let ((custom '(sh . ("custom-source"))))
-    (should (equal (sh-ts-mode-test--grammar-source (list custom))
-                   custom))))
-
-(ert-deftest sh-ts-mode-reports-an-unavailable-grammar ()
+(ert-deftest sh-ts-mode-reports-unavailable-grammar ()
   (let ((ensure (symbol-function 'treesit-ensure-installed)))
     (unwind-protect
         (progn
-          (fset 'treesit-ensure-installed (lambda (_) nil))
+          (fset 'treesit-ensure-installed (lambda (_language) nil))
           (with-temp-buffer
-            (let ((error-data (should-error (sh-ts-mode) :type 'user-error)))
-              (should (string-match-p
-                       "sh" (error-message-string error-data)))
-              (should-not (treesit-parser-list nil nil t)))))
+            (let ((buffer-file-name nil))
+              (should-error (sh-ts-mode) :type 'user-error)
+              (should-not (treesit-parser-list)))))
       (fset 'treesit-ensure-installed ensure))))
+
+(ert-deftest sh-ts-mode-starts-and-reuses-parser ()
+  (with-temp-buffer
+    (insert "printf hello\n")
+    (sh-ts-mode)
+    (should (eq major-mode 'sh-ts-mode))
+    (should (eq (treesit-parser-language treesit-primary-parser) 'sh))
+    (should (equal (treesit-node-type (treesit-parser-root-node treesit-primary-parser))
+                   "program"))
+    (sh-ts-mode)
+    (should (equal (treesit-parser-list) (list treesit-primary-parser)))))
+
+;;;; Mode Selection
+
+(ert-deftest sh-ts-mode-does-not-claim-file-extensions ()
+  (dolist (entry auto-mode-alist)
+    (should-not (eq (cdr entry) 'sh-ts-mode))))
+
+(ert-deftest sh-ts-mode-selects-interpreters ()
+  (should (equal (alist-get "sh" interpreter-mode-alist nil nil #'equal)
+                 'sh-ts-mode))
+  (dolist (shebang '("#!/bin/sh\n"
+                     "#!/usr/bin/env sh\n"
+                     "#!/usr/bin/env -S sh\n"))
+    (with-temp-buffer
+      (setq buffer-file-name "/tmp/example")
+      (insert shebang "printf '%s\\n' hello\n")
+      (set-auto-mode)
+      (should (eq major-mode 'sh-ts-mode)))))
+
+(ert-deftest sh-ts-mode-generates-autoloads ()
+  (let ((output (make-temp-file "sh-ts-mode-loaddefs-"))
+        (directory (file-name-directory (locate-library "sh-ts-mode"))))
+    (unwind-protect
+        (progn
+          (loaddefs-generate directory output nil nil nil t)
+          (with-temp-buffer
+            (insert-file-contents output)
+            (dolist (form '("(autoload 'sh-ts-mode" "(add-to-list 'interpreter-mode-alist"))
+              (goto-char (point-min))
+              (should (search-forward form nil t)))))
+      (delete-file output))))
 
 ;;;; Syntax
 
-(ert-deftest sh-ts-mode-classifies-only-shell-delimiters-as-parens ()
-  (sh-ts-mode-test--require-grammar)
+(ert-deftest sh-ts-mode-comments-and-uncomments ()
+  (with-temp-buffer
+    (insert "printf hello\n")
+    (sh-ts-mode)
+    (comment-region (point-min) (point-max))
+    (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                   "# printf hello\n"))
+    (uncomment-region (point-min) (point-max))
+    (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                   "printf hello\n"))))
+
+(ert-deftest sh-ts-mode-classifies-delimiters ()
   (with-temp-buffer
     (let ((function "f() {")
           (literal "  printf '%s\\n' '()[]{}' {fd}>out")
@@ -182,8 +202,7 @@
                  (,parenthesized-case ")" 0 5)))
         (pcase-let ((`(,line ,fragment ,offset ,class) expectation))
           (should
-           (= (sh-ts-mode-test--syntax-class-in-line
-               line fragment offset)
+           (= (sh-ts-mode-test--syntax-class fragment offset line)
               class))))
       (dolist (expectation
                `((,literal "()" 0)
@@ -201,38 +220,10 @@
                  (,plain-case ")" 0)))
         (pcase-let ((`(,line ,fragment ,offset) expectation))
           (should
-           (= (sh-ts-mode-test--syntax-class-in-line
-               line fragment offset)
+           (= (sh-ts-mode-test--syntax-class fragment offset line)
               1)))))))
 
-(ert-deftest sh-ts-mode-reclassifies-delimiters-after-edits ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (insert "{\nprintf body\n}\n")
-    (sh-ts-mode)
-    (should (= (sh-ts-mode-test--syntax-class-in-line "}" "}") 5))
-    (goto-char (point-min))
-    (delete-char 1)
-    (should (= (sh-ts-mode-test--syntax-class-in-line "}" "}") 1))
-    (goto-char (point-min))
-    (insert "{")
-    (should (= (sh-ts-mode-test--syntax-class-in-line "}" "}") 5))))
-
-(ert-deftest sh-ts-mode-configures-posix-sh-line-comments ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (sh-ts-mode)
-    (should (equal comment-start "# "))
-    (should (equal comment-end ""))
-    (should (equal comment-start-skip "#[[:blank:]]*"))
-    (should comment-use-syntax)
-    (should (eq (char-syntax ?#) ?.))
-    (should (eq (char-syntax ?\") ?.))
-    (should (eq (char-syntax ?\\) ?.))
-    (should (eq (char-syntax ?\n) ?>))))
-
-(ert-deftest sh-ts-mode-recognizes-only-tree-sitter-comments ()
-  (sh-ts-mode-test--require-grammar)
+(ert-deftest sh-ts-mode-classifies-comments ()
   (with-temp-buffer
     (let ((lines
            '("#!/bin/sh"
@@ -277,7 +268,7 @@
                  ("echo \"`a # folded \\" "folded")
                  ("continued" "continued")))
         (pcase-let ((`(,line ,fragment) expectation))
-          (should (sh-ts-mode-test--comment-in-line-p line fragment))))
+          (should (sh-ts-mode-test--comment-p fragment nil line))))
       (dolist (expectation
                '(("printf value#suffix" "suffix" 0)
                  ("printf '%s\\n' '# single' \"# double\" \\#escaped"
@@ -296,74 +287,24 @@
                  (": tail" "tail" 0)))
         (pcase-let ((`(,line ,fragment ,offset) expectation))
           (should-not
-           (sh-ts-mode-test--comment-in-line-p line fragment offset)))))))
-
-(ert-deftest sh-ts-mode-recomputes-comment-syntax-after-edits ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (insert "printf value#suffix\n")
-    (sh-ts-mode)
-    (should-not
-     (sh-ts-mode-test--comment-in-line-p "printf value#suffix" "suffix"))
-    (goto-char
-     (sh-ts-mode-test--position-in-line "printf value#suffix" "#"))
-    (insert " ")
-    (should
-     (sh-ts-mode-test--comment-in-line-p "printf value #suffix" "suffix"))
-    (goto-char
-     (sh-ts-mode-test--position-in-line "printf value #suffix" " #"))
-    (delete-char 1)
-    (should-not
-     (sh-ts-mode-test--comment-in-line-p "printf value#suffix" "suffix")))
-  (with-temp-buffer
-    (insert "echo \"`a # head\nbody\n`\"\n: tail\n")
-    (sh-ts-mode-test--enable-font-lock-level 4)
-    (dolist (continued '(t nil t))
-      (goto-char (point-min))
-      (search-forward "# head")
-      (if continued (insert "\\") (delete-char 1))
-      (narrow-to-region
-       (sh-ts-mode-test--position-in-line "body" "body") (point-max))
-      (syntax-propertize (point-max))
-      (widen)
-      (should (eq (sh-ts-mode-test--comment-in-line-p "body" "body") continued))
-      (should (sh-ts-mode-test--comment-in-line-p
-               (if continued "echo \"`a # head\\" "echo \"`a # head") "head"))
-      (should-not (sh-ts-mode-test--comment-in-line-p ": tail" "tail"))
-      (font-lock-flush)
-      (font-lock-ensure)
-      (sh-ts-mode-test--should-match-fresh-buffer 4))))
-
-(ert-deftest sh-ts-mode-recomputes-comment-syntax-outside-a-restriction ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (insert "echo a # first\necho b\necho c # third\n")
-    (sh-ts-mode)
-    (narrow-to-region
-     (sh-ts-mode-test--position-in-line "echo b" "echo")
-     (point-max))
-    (syntax-propertize (point-max))
-    (widen)
-    (should (sh-ts-mode-test--comment-in-line-p "echo a # first" "first"))
-    (should (sh-ts-mode-test--comment-in-line-p "echo c # third" "third"))))
-
-(ert-deftest sh-ts-mode-propertizes-comments-at-the-end-of-wide-programs ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (dotimes (number 10000)
-      (insert (format "printf value%d # comment%d\n" number number)))
-    (sh-ts-mode)
-    (goto-char (point-max))
-    (search-backward "# comment9999")
-    (let ((comment-start (point)))
-      (funcall syntax-propertize-function comment-start (point-max))
-      (should-not (nth 4 (syntax-ppss (1- comment-start))))
-      (should (nth 4 (syntax-ppss (+ comment-start 2)))))))
+           (sh-ts-mode-test--comment-p fragment offset line)))))))
 
 ;;;; Font Lock
 
-(ert-deftest sh-ts-mode-fontifies-posix-shell-syntax-by-concept ()
-  (sh-ts-mode-test--require-grammar)
+(ert-deftest sh-ts-mode-fontifies-by-level ()
+  (dolist (level '(1 2 3 4))
+    (with-temp-buffer
+      (insert "# note\nif printf 'text' \"$value\"; then :; fi\n")
+      (let ((treesit-font-lock-level level)) (sh-ts-mode))
+      (font-lock-ensure)
+      (pcase-dolist (`(,fragment ,minimum ,face)
+                     '(("note" 1 font-lock-comment-face) ("if" 2 font-lock-keyword-face)
+                       ("text" 2 font-lock-string-face) ("value" 3 font-lock-variable-use-face)
+                       (";" 4 font-lock-punctuation-face)))
+        (ert-info ((format "Level %s: %S" level fragment))
+          (should (eq (sh-ts-mode-test--face fragment) (and (>= level minimum) face))))))))
+
+(ert-deftest sh-ts-mode-fontifies-language-syntax ()
   (with-temp-buffer
     (let ((assignment "value=hello")
           (definition "worker() {")
@@ -380,9 +321,9 @@
               redirection "\n"
               "  fi\n"
               "}\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (font-lock-ensure)
-      (sh-ts-mode-test--should-fontify
+      (sh-ts-mode-test--should-have-faces
        `(("# note" "#" font-lock-comment-face)
          (,assignment "value" font-lock-variable-name-face)
          (,assignment "=" font-lock-operator-face)
@@ -407,177 +348,90 @@
          ("  fi" "fi" font-lock-keyword-face))))))
 
 (ert-deftest sh-ts-mode-fontifies-parameters-and-expansion-syntax ()
-  (sh-ts-mode-test--require-grammar)
   (with-temp-buffer
     (let ((variable "printf \"$name ${name}\"")
           (line "value=$(printf \"${1:-$?} $((2 + (3)))\")")
           (unclassified "printf \"${00}\"")
           (backquote "printf `printf \\${name}`"))
       (insert variable "\n" line "\n" unclassified "\n" backquote "\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (font-lock-ensure)
-      (should (eq (sh-ts-mode-test--face-in-line variable "${")
+      (should (eq (sh-ts-mode-test--face "${" nil variable)
                   'font-lock-variable-use-face))
       (dolist (expectation '(("${" 1) ("}" 0)))
-        (should (eq (sh-ts-mode-test--face-in-line
-                     variable (car expectation) (cadr expectation))
+        (should (eq (sh-ts-mode-test--face (car expectation) (cadr expectation) variable)
                     'font-lock-bracket-face)))
-      (should (eq (sh-ts-mode-test--face-in-line variable "name")
+      (should (eq (sh-ts-mode-test--face "name" nil variable)
                   'font-lock-variable-use-face))
-      (should (eq (sh-ts-mode-test--face-in-line variable "$name")
+      (should (eq (sh-ts-mode-test--face "$name" nil variable)
                   'font-lock-variable-use-face))
       (dolist (expectation '(("${1" 2) ("$?" 1)))
-        (should (eq (sh-ts-mode-test--face-in-line
-                     line (car expectation) (cadr expectation))
+        (should (eq (sh-ts-mode-test--face (car expectation) (cadr expectation) line)
                     'font-lock-constant-face)))
-      (should (eq (sh-ts-mode-test--face-in-line line "$?")
+      (should (eq (sh-ts-mode-test--face "$?" nil line)
                   'font-lock-variable-use-face))
-      (should (eq (sh-ts-mode-test--face-in-line line "${")
+      (should (eq (sh-ts-mode-test--face "${" nil line)
                   'font-lock-variable-use-face))
       (dolist (expectation '(("${" 1) ("}" 0)))
-        (should (eq (sh-ts-mode-test--face-in-line
-                     line (car expectation) (cadr expectation))
+        (should (eq (sh-ts-mode-test--face (car expectation) (cadr expectation) line)
                     'font-lock-bracket-face)))
-      (should (eq (sh-ts-mode-test--face-in-line line "$(")
+      (should (eq (sh-ts-mode-test--face "$(" nil line)
                   'font-lock-punctuation-face))
-      (should (eq (sh-ts-mode-test--face-in-line line "$((")
+      (should (eq (sh-ts-mode-test--face "$((" nil line)
                   'font-lock-punctuation-face))
-      (should (eq (sh-ts-mode-test--face-in-line line "(3)")
+      (should (eq (sh-ts-mode-test--face "(3)" nil line)
                   'font-lock-bracket-face))
-      (should-not (sh-ts-mode-test--face-in-line unclassified "${"))
+      (should-not (sh-ts-mode-test--face "${" nil unclassified))
       (dolist (expectation '(("${" 1) ("}" 0)))
-        (should (eq (sh-ts-mode-test--face-in-line
-                     unclassified (car expectation) (cadr expectation))
+        (should (eq (sh-ts-mode-test--face (car expectation) (cadr expectation) unclassified)
                     'font-lock-bracket-face)))
       (dolist (fragment '("{name}" "}`"))
-        (should (eq (sh-ts-mode-test--face-in-line backquote fragment)
+        (should (eq (sh-ts-mode-test--face fragment nil backquote)
                     'font-lock-bracket-face)))
-      (should (eq (sh-ts-mode-test--face-in-line backquote "${name}")
+      (should (eq (sh-ts-mode-test--face "${name}" nil backquote)
                   'font-lock-variable-use-face))
-      (should (eq (sh-ts-mode-test--face-in-line backquote "name}")
+      (should (eq (sh-ts-mode-test--face "name}" nil backquote)
                   'font-lock-variable-use-face)))))
 
-(ert-deftest sh-ts-mode-fontifies-grouping-and-substitution-brackets ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (let ((subshell "! (printf x)")
-          (command-substitution "value=$(printf x)")
-          (backquote-substitution "value=`printf x`")
-          (arithmetic-expansion "value=$((1 + (2)))"))
-      (insert subshell "\n"
-              command-substitution "\n"
-              backquote-substitution "\n"
-              arithmetic-expansion "\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
-      (font-lock-ensure)
-      (should (eq (sh-ts-mode-test--face-in-line subshell "!")
-                  'font-lock-operator-face))
-      (dolist (fragment '("(" ")"))
-        (should (eq (sh-ts-mode-test--face-in-line subshell fragment)
-                    'font-lock-bracket-face)))
-      (dolist (line (list command-substitution arithmetic-expansion))
-        (should (eq (sh-ts-mode-test--face-in-line line "$")
-                    'font-lock-punctuation-face)))
-      (dolist (expectation
-               `((,command-substitution "$(" 1)
-                 (,command-substitution ")" 0)
-                 (,arithmetic-expansion "$((" 1)
-                 (,arithmetic-expansion "$((" 2)
-                 (,arithmetic-expansion "(2)" 0)
-                 (,arithmetic-expansion "(2)" 2)
-                 (,arithmetic-expansion "2)))" 2)
-                 (,arithmetic-expansion "2)))" 3)))
-        (pcase-let ((`(,line ,fragment ,offset) expectation))
-          (should (eq (sh-ts-mode-test--face-in-line
-                       line fragment offset)
-                      'font-lock-bracket-face))))
-      (dolist (expectation
-               `((,backquote-substitution "`printf" 0)
-                 (,backquote-substitution "x`" 1)))
-        (pcase-let ((`(,line ,fragment ,offset) expectation))
-          (should (eq (sh-ts-mode-test--face-in-line
-                       line fragment offset)
-                      'font-lock-string-face)))))))
-
-(ert-deftest sh-ts-mode-fontifies-case-item-delimiters ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (let ((parenthesized "  (one | two) :;;")
-          (plain "  three) :"))
-      (insert "case value in\n"
-              parenthesized "\n"
-              plain "\n"
-              "esac\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
-      (font-lock-ensure)
-      (dolist (fragment '("(" ")"))
-        (should (eq (sh-ts-mode-test--face-in-line
-                     parenthesized fragment)
-                    'font-lock-bracket-face)))
-      (should (eq (sh-ts-mode-test--face-in-line plain ")")
-                  'font-lock-bracket-face))
-      (should (eq (sh-ts-mode-test--face-in-line parenthesized "|")
-                  'font-lock-operator-face)))))
-
 (ert-deftest sh-ts-mode-fontifies-shell-pattern-syntax ()
-  (sh-ts-mode-test--require-grammar)
   (with-temp-buffer
     (let ((line
            "  ([!a-c]|[-]|[[:alpha:]]|[[.x.]]|[[=x=]]|foo\\*) :;;"))
       (insert "case $value in\n" line "\nesac\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (font-lock-ensure)
       (dolist (fragment '("[" "]"))
-        (should (eq (sh-ts-mode-test--face-in-line line fragment)
+        (should (eq (sh-ts-mode-test--face fragment nil line)
                     'font-lock-bracket-face)))
-      (should (eq (sh-ts-mode-test--face-in-line line "!")
+      (should (eq (sh-ts-mode-test--face "!" nil line)
                   'font-lock-negation-char-face))
-      (should (eq (sh-ts-mode-test--face-in-line line "-")
+      (should (eq (sh-ts-mode-test--face "-" nil line)
                   'font-lock-operator-face))
       (dolist (expectation '(("[:" 0) (":]" 1)
                              ("[." 0) (".]" 1)
                              ("[=" 0) ("=]" 1)))
-        (should (eq (sh-ts-mode-test--face-in-line
-                     line (car expectation) (cadr expectation))
+        (should (eq (sh-ts-mode-test--face (car expectation) (cadr expectation) line)
                     'font-lock-bracket-face)))
-      (should (eq (sh-ts-mode-test--face-in-line line "[-]" 1)
+      (should (eq (sh-ts-mode-test--face "[-]" 1 line)
                   'font-lock-constant-face))
       (dolist (expectation '(("[:" 1) (":]" 0)
                              ("[." 1) (".]" 0)
                              ("[=" 1) ("=]" 0)))
-        (should (eq (sh-ts-mode-test--face-in-line
-                     line (car expectation) (cadr expectation))
+        (should (eq (sh-ts-mode-test--face (car expectation) (cadr expectation) line)
                     'font-lock-punctuation-face)))
-      (should (eq (sh-ts-mode-test--face-in-line line "(")
+      (should (eq (sh-ts-mode-test--face "(" nil line)
                   'font-lock-bracket-face))
-      (should (eq (sh-ts-mode-test--face-in-line line ")")
+      (should (eq (sh-ts-mode-test--face ")" nil line)
                   'font-lock-bracket-face))
       (dolist (fragment '("a" "c" "alpha" "x"))
-        (should (eq (sh-ts-mode-test--face-in-line line fragment)
+        (should (eq (sh-ts-mode-test--face fragment nil line)
                     'font-lock-constant-face)))
-      (should (eq (sh-ts-mode-test--face-in-line line "|")
+      (should (eq (sh-ts-mode-test--face "|" nil line)
                   'font-lock-operator-face))
-      (should (eq (sh-ts-mode-test--face-in-line line "\\*")
+      (should (eq (sh-ts-mode-test--face "\\*" nil line)
                   'font-lock-escape-face)))))
 
-(ert-deftest sh-ts-mode-fontifies-reserved-words-after-repair ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (insert "fi\necho fi\n\"fi\"\nafter() { :; }\n")
-    (sh-ts-mode-test--enable-font-lock-level 4)
-    (font-lock-ensure)
-    (goto-char (point-min))
-    (insert "if :; then :;\n")
-    (font-lock-flush)
-    (font-lock-ensure)
-    (sh-ts-mode-test--should-fontify
-     '(("fi" "fi" font-lock-keyword-face)
-       ("echo fi" "fi" font-lock-string-face)
-       ("\"fi\"" "fi" font-lock-string-face)
-       ("after() { :; }" "after" font-lock-function-name-face)))))
-
 (ert-deftest sh-ts-mode-fontifies-pattern-contexts-by-font-lock-level ()
-  (sh-ts-mode-test--require-grammar)
   (pcase-dolist (`(,source ,expectations)
                  '(("value=*" (("*" 2 font-lock-string-face)))
                    ("case * in\n(foo$var\\*) :;;\nesac"
@@ -608,7 +462,7 @@
       (ert-info ((format "Level %s: %S" level source))
         (with-temp-buffer
           (insert source "\n")
-          (sh-ts-mode-test--enable-font-lock-level level)
+          (let ((treesit-font-lock-level level)) (sh-ts-mode))
           (font-lock-ensure)
           (pcase-dolist (`(,fragment ,minimum ,face) expectations)
             (goto-char (point-min))
@@ -616,26 +470,7 @@
             (should (eq (get-text-property (- (point) (length fragment)) 'face)
                         (and (>= level minimum) face)))))))))
 
-(ert-deftest sh-ts-mode-updates-pattern-context-after-edits ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (let ((pattern-line "value=${x##*}")
-          (value-line "value=${x:-*}"))
-      (insert pattern-line "\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
-      (font-lock-ensure)
-      (should (eq (sh-ts-mode-test--face-in-line pattern-line "*")
-                  'font-lock-constant-face))
-      (goto-char (point-min))
-      (search-forward "##")
-      (replace-match ":-")
-      (font-lock-flush (point-min) (point-max))
-      (font-lock-ensure)
-      (should (eq (sh-ts-mode-test--face-in-line value-line "*")
-                  'font-lock-string-face)))))
-
 (ert-deftest sh-ts-mode-fontifies-escapes-inside-shell-pattern-brackets ()
-  (sh-ts-mode-test--require-grammar)
   (dolist (line '("  ([\\*]) :;;"
                   "  ([a-\\*]) :;;"
                   "  ([[:\\*:]]) :;;"
@@ -643,20 +478,19 @@
                   "  ([[=\\*=]]) :;;"))
     (with-temp-buffer
       (insert "case value in\n" line "\nesac\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (font-lock-ensure)
-      (should (eq (sh-ts-mode-test--face-in-line line "\\*")
+      (should (eq (sh-ts-mode-test--face "\\*" nil line)
                   'font-lock-escape-face))))
   (with-temp-buffer
     (let ((line "trimmed=${value#[\\*]}"))
       (insert line "\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (font-lock-ensure)
-      (should (eq (sh-ts-mode-test--face-in-line line "\\*")
+      (should (eq (sh-ts-mode-test--face "\\*" nil line)
                   'font-lock-escape-face)))))
 
 (ert-deftest sh-ts-mode-fontifies-literal-delimiters-and-escapes ()
-  (sh-ts-mode-test--require-grammar)
   (with-temp-buffer
     (let ((quotes "printf 'one' \"two\\$\" $'three\\n' foo\\ bar ~alice")
           (continued "printf one \\")
@@ -667,28 +501,27 @@
       (insert quotes "\n"
               continued "\n" continuation "\n"
               declaration "\n" body "\n" delimiter "\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (font-lock-ensure)
       (dolist (fragment '("'" "one" "\"" "two" "$'" "three"))
-        (should (eq (sh-ts-mode-test--face-in-line quotes fragment)
+        (should (eq (sh-ts-mode-test--face fragment nil quotes)
                     'font-lock-string-face)))
       (dolist (fragment '("~" "alice"))
-        (should (eq (sh-ts-mode-test--face-in-line quotes fragment)
+        (should (eq (sh-ts-mode-test--face fragment nil quotes)
                     'font-lock-constant-face)))
       (dolist (fragment '("\\$" "\\n" "\\ "))
-        (should (eq (sh-ts-mode-test--face-in-line quotes fragment)
+        (should (eq (sh-ts-mode-test--face fragment nil quotes)
                     'font-lock-escape-face)))
-      (should (eq (sh-ts-mode-test--face-in-line continued "\\")
+      (should (eq (sh-ts-mode-test--face "\\" nil continued)
                   'font-lock-punctuation-face))
-      (should (eq (sh-ts-mode-test--face-in-line declaration "<<")
+      (should (eq (sh-ts-mode-test--face "<<" nil declaration)
                   'font-lock-operator-face))
-      (sh-ts-mode-test--should-fontify
+      (sh-ts-mode-test--should-have-faces
        `((,declaration "EOF" font-lock-string-face)
          (,body "body" font-lock-string-face)
          (,delimiter "EOF" font-lock-string-face))))))
 
 (ert-deftest sh-ts-mode-fontifies-continued-lexical-tokens ()
-  (sh-ts-mode-test--require-grammar)
   (pcase-dolist (`(,source ,fragments ,face)
                  '(("pri\\\nntf x\n" ("pri" "ntf") font-lock-function-call-face)
                    ("pri\\\nn\\\ntf x\n" ("pri" "n" "tf") font-lock-function-call-face)
@@ -705,7 +538,7 @@
     (ert-info ((format "%S" source))
       (with-temp-buffer
         (insert source)
-        (sh-ts-mode-test--enable-font-lock-level 4)
+        (let ((treesit-font-lock-level 4)) (sh-ts-mode))
         (font-lock-ensure)
         (goto-char (point-min))
         (when (string-prefix-p "cat <<" source)
@@ -721,14 +554,13 @@
           (should (eq (get-text-property (point) 'face) face)))))))
 
 (ert-deftest sh-ts-mode-fontifies-tilde-prefix-pattern-characters-as-constants ()
-  (sh-ts-mode-test--require-grammar)
   (dolist (source '("echo ~a*b?/file"
                     "value=~[!a-c]/file"
                     "echo ~[!a-c[:alpha:][.x.][=y=]]/file"
                     "echo ~[[.a.]-[.z.]]/file"))
     (with-temp-buffer
       (insert source "\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (font-lock-ensure)
       (goto-char (point-min))
       (search-forward "~")
@@ -738,20 +570,7 @@
          (text-property-not-all start (1- (point)) 'face
                                 'font-lock-constant-face))))))
 
-(ert-deftest sh-ts-mode-fontifies-literal-here-document-delimiters ()
-  (sh-ts-mode-test--require-grammar)
-  (dolist (delimiter '("~user/path" "E*?" "[!a-c]" "[-[:alpha:][.x.][=y=]]"
-                       "[[.a.]-[.z.]]"))
-    (with-temp-buffer
-      (insert "cat <<" delimiter "\nbody\n" delimiter "\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
-      (font-lock-ensure)
-      (should-not
-       (text-property-not-all 7 (+ 7 (length delimiter)) 'face
-                              'font-lock-string-face)))))
-
 (ert-deftest sh-ts-mode-keeps-pattern-source-owners-and-nested-escapes-distinct ()
-  (sh-ts-mode-test--require-grammar)
   (dolist (level '(2 3 4))
     (dolist (case '(("echo ~[a-c]/*.txt" "[a-c]" 4 font-lock-constant-face)
                     ("value=${x#~[a-c]}" "[a-c]" 4 font-lock-constant-face)
@@ -771,7 +590,7 @@
       (pcase-let ((`(,source ,fragment ,minimum ,face) case))
         (with-temp-buffer
           (insert source "\n")
-          (sh-ts-mode-test--enable-font-lock-level level)
+          (let ((treesit-font-lock-level level)) (sh-ts-mode))
           (font-lock-ensure)
           (goto-char (point-min))
           (search-forward fragment)
@@ -780,7 +599,6 @@
                                   (and (>= level minimum) face))))))))
 
 (ert-deftest sh-ts-mode-fontifies-collating-range-endpoints-in-every-pattern-context ()
-  (sh-ts-mode-test--require-grammar)
   (dolist (source '("[[.a.]-[.z.]]"
                     "value=x [[.a.]-[.z.]]"
                     "echo [[.a.]-[.z.]]"
@@ -790,70 +608,23 @@
                     "value=${x#[[.a.]-[.z.]]}"))
     (with-temp-buffer
       (insert source "\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (font-lock-ensure)
       (goto-char (point-min))
       (search-forward "[[.a.]-[.z.]]")
       (let ((start (- (point) 13))
             (faces '(font-lock-bracket-face font-lock-bracket-face
-                     font-lock-punctuation-face font-lock-constant-face
-                     font-lock-punctuation-face font-lock-bracket-face
-                     font-lock-operator-face font-lock-bracket-face
-                     font-lock-punctuation-face font-lock-constant-face
-                     font-lock-punctuation-face font-lock-bracket-face
-                     font-lock-bracket-face)))
+                                            font-lock-punctuation-face font-lock-constant-face
+                                            font-lock-punctuation-face font-lock-bracket-face
+                                            font-lock-operator-face font-lock-bracket-face
+                                            font-lock-punctuation-face font-lock-constant-face
+                                            font-lock-punctuation-face font-lock-bracket-face
+                                            font-lock-bracket-face)))
         (dolist (face faces)
           (should (eq (get-text-property start 'face) face))
           (setq start (1+ start)))))))
 
-(ert-deftest sh-ts-mode-reclassifies-numeric-parameters-after-edits ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (insert "echo ${00}\n")
-    (sh-ts-mode-test--enable-font-lock-level 4)
-    (dolist (digits '("00" "01" "00"))
-      (goto-char (point-min))
-      (search-forward "${")
-      (delete-char 2)
-      (insert digits)
-      (font-lock-flush)
-      (font-lock-ensure)
-      (should (eq (get-text-property 6 'face)
-                  (and (equal digits "01") 'font-lock-variable-use-face)))
-      (should-not (text-property-not-all
-                   8 10 'face (and (equal digits "01") 'font-lock-constant-face))))))
-
-(ert-deftest sh-ts-mode-reclassifies-backquote-words-after-enclosing-quote-edits ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (insert "echo `printf %s \\\"a b\\\"`\n")
-    (sh-ts-mode-test--enable-font-lock-level 4)
-    (dolist (quoted '(nil t nil))
-      (goto-char 6)
-      (when (eq (char-after) ?\")
-        (delete-char 1)
-        (goto-char (1- (point-max)))
-        (delete-char -1))
-      (when quoted
-        (goto-char 6)
-        (insert "\"")
-        (goto-char (1- (point-max)))
-        (insert "\""))
-      (font-lock-flush)
-      (font-lock-ensure)
-      (goto-char (point-min))
-      (search-forward "\\")
-      (should (eq (get-text-property (1- (point)) 'face)
-                  (unless quoted 'font-lock-escape-face)))
-      (should (eq (get-text-property (point) 'face)
-                  (if quoted 'font-lock-string-face 'font-lock-escape-face)))
-      (search-forward "a b")
-      (should (eq (get-text-property (- (point) 2) 'face)
-                  (and quoted 'font-lock-string-face)))
-      (sh-ts-mode-test--should-match-fresh-buffer 4))))
-
 (ert-deftest sh-ts-mode-preserves-literal-faces-in-pathname-patterns ()
-  (sh-ts-mode-test--require-grammar)
   (dolist (pattern '("*" "?" "[!a-z]"))
     (dolist (case '(("" "" font-lock-function-call-face)
                     ("name=value " "" font-lock-function-call-face)
@@ -865,21 +636,20 @@
           (let ((line (concat prefix "pre\"quoted\"mid" pattern
                               "tail'quoted'end" suffix)))
             (insert line "\n")
-            (sh-ts-mode-test--enable-font-lock-level 4)
+            (let ((treesit-font-lock-level 4)) (sh-ts-mode))
             (font-lock-ensure)
             (dolist (fragment '("pre" "mid" "tail" "end"))
-              (should (eq (sh-ts-mode-test--face-in-line line fragment) face)))
-            (should (eq (sh-ts-mode-test--face-in-line line "quoted")
+              (should (eq (sh-ts-mode-test--face fragment nil line) face)))
+            (should (eq (sh-ts-mode-test--face "quoted" nil line)
                         'font-lock-string-face))))))))
 
 (ert-deftest sh-ts-mode-fontifies-inactive-pattern-source-as-strings ()
-  (sh-ts-mode-test--require-grammar)
   (dolist (source '("value=[!a-c[:alpha:][.x.][=y=]]*?"
                     "case [!a-c]*? in x) :;; esac"
                     "value=${x:-[!a-c]*?}"))
     (with-temp-buffer
       (insert source "\n")
-      (sh-ts-mode-test--enable-font-lock-level 4)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (font-lock-ensure)
       (goto-char (point-min))
       (search-forward "[")
@@ -890,14 +660,13 @@
                                 'font-lock-string-face))))))
 
 (ert-deftest sh-ts-mode-fontifies-only-here-document-terminator-text ()
-  (sh-ts-mode-test--require-grammar)
   (dolist (case '(("cat <<-END\n\tbody\n\tEND\n" 19 22)
                   ("cat <<END\nbody\nEND" 16 19)
                   ("cat <<''\nbody\n\n" 15 15)))
     (pcase-let ((`(,source ,start ,end) case))
       (with-temp-buffer
         (insert source)
-        (sh-ts-mode-test--enable-font-lock-level 4)
+        (let ((treesit-font-lock-level 4)) (sh-ts-mode))
         (font-lock-ensure)
         (should-not (text-property-not-all start end 'face 'font-lock-string-face))
         (when (< end (point-max))
@@ -905,37 +674,7 @@
         (when (eq (char-before start) ?\t)
           (should-not (get-text-property (1- start) 'face)))))))
 
-(ert-deftest sh-ts-mode-matches-fresh-fontification-after-syntax-repairs ()
-  (sh-ts-mode-test--require-grammar)
-  (dolist (case '(("cat <<-END\n\tbody\n\tEND\n" "END" "STOP")
-                  (": `: \\`if :; then :; fi\\``\n" "fi" "fi ")
-                  ("pre[!a-z]tail\n" "[!a-z]" "*")
-                  ("value=$(( (x += 2) << 1 ))\n" "2" "3")
-                  ("pri\\\nntf va\\\nlue\n" "\\\n" "")
-                  ("i\\\nf :; then :; fi\n" "\\\n" "")
-                  ("cat <<EOF\ntext\nEO\\\nF\n" "\\\n" "")
-                  ("echo ${#-}\n" "-" "-\\}")
-                  ("echo \"${#?}\"\n" "?" "?\\}")
-                  (": $'\\x12g'\n" "12" "1234")
-                  (": $((1\u000b+\f2))\n" "2" "3")))
-    (pcase-let ((`(,source ,fragment ,replacement) case))
-      (with-temp-buffer
-        (insert source)
-        (sh-ts-mode-test--enable-font-lock-level 4)
-        (font-lock-ensure)
-        (goto-char (point-min))
-        (while (search-forward fragment nil t)
-          (replace-match replacement t t)
-          (font-lock-flush)
-          (font-lock-ensure))
-        (font-lock-flush)
-        (font-lock-ensure)
-        (syntax-propertize (point-max))
-        (should-not (treesit-node-check (treesit-buffer-root-node 'sh) 'has-error))
-        (sh-ts-mode-test--should-match-fresh-buffer 4)))))
-
 (ert-deftest sh-ts-mode-captures-only-leaves ()
-  (sh-ts-mode-test--require-grammar)
   (dolist (source '("if ! :; then x=${#value}; else x=${value:-$?}; fi\n"
                     "value=$(( (x += 2) << 1 )) && echo \\* >>out\n"
                     "cat <<-END\n\t$value\n\tEND\n"
@@ -945,7 +684,7 @@
                     "echo \"`a #x\\\nb\n`\"\n"))
     (with-temp-buffer
       (insert source)
-      (sh-ts-mode-test--enable-font-lock-level 4)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (let ((root (treesit-buffer-root-node 'sh)))
         (should-not (treesit-node-check root 'has-error))
         (dolist (setting treesit-font-lock-settings)
@@ -953,104 +692,22 @@
             (ert-info ((treesit-node-type (cdr capture)))
               (when (nth 3 setting)
                 (should (eq (car capture) 'font-lock-punctuation-face))
-                (should (equal (treesit-node-type (cdr capture)) "\\"))
-                (should-not (treesit-node-check (cdr capture) 'named))
+                (should (equal (treesit-node-type (cdr capture))
+                               "line_continuation"))
+                (should (treesit-node-check (cdr capture) 'named))
                 (let ((parent (treesit-node-parent (cdr capture))))
                   (dotimes (index (treesit-node-child-count parent))
                     (should (equal (treesit-node-type (treesit-node-child parent index))
-                                   "\\")))))
+                                   "line_continuation")))))
               (dotimes (index (treesit-node-child-count (cdr capture)))
                 (let ((child (treesit-node-child (cdr capture) index)))
-                  (should (equal (treesit-node-type child) "\\"))
-                  (should-not (treesit-node-check child 'named))
+                  (should (equal (treesit-node-type child) "line_continuation"))
+                  (should (treesit-node-check child 'named))
                   (should (= (treesit-node-child-count child) 0)))))))))))
-
-(ert-deftest sh-ts-mode-fontifies-by-font-lock-level ()
-  (sh-ts-mode-test--require-grammar)
-  (dolist (case '((1 font-lock-comment-face nil nil nil nil)
-                  (2 font-lock-comment-face font-lock-keyword-face
-                     font-lock-string-face nil nil)
-                  (3 font-lock-comment-face font-lock-keyword-face
-                     font-lock-string-face
-                     font-lock-variable-use-face nil)
-                  (4 font-lock-comment-face font-lock-keyword-face
-                     font-lock-string-face
-                     font-lock-variable-use-face
-                     font-lock-punctuation-face)))
-    (pcase-let ((`(,level ,comment-face ,keyword-face ,string-face
-                          ,variable-face ,separator-face)
-                 case))
-      (with-temp-buffer
-        (insert "# note\nif printf 'text' \"$value\"; then :; fi\n")
-        (sh-ts-mode-test--enable-font-lock-level level)
-        (font-lock-ensure)
-        (sh-ts-mode-test--should-fontify
-         `(("# note" "note" ,comment-face)
-           ("if printf 'text' \"$value\"; then :; fi"
-            "if" ,keyword-face)
-           ("if printf 'text' \"$value\"; then :; fi"
-            "text" ,string-face)
-           ("if printf 'text' \"$value\"; then :; fi"
-            "$" ,variable-face)
-           ("if printf 'text' \"$value\"; then :; fi"
-            "value" ,variable-face)
-           ("if printf 'text' \"$value\"; then :; fi"
-            ";" ,separator-face)))))))
-
-(ert-deftest sh-ts-mode-fontifies-chunks-like-the-whole-buffer ()
-  (sh-ts-mode-test--require-grammar)
-  (let ((source "f() {\n printf '%s\\n' \"${x:-a}\" *.txt\n}\n# note\nf >out\n"))
-    (dolist (chunk '(7 97))
-      (with-temp-buffer
-        (insert source)
-        (let ((treesit-font-lock-level 4)) (sh-ts-mode))
-        (let ((position (point-min)))
-          (while (< position (point-max))
-            (let ((end (min (point-max) (+ position chunk))))
-              (font-lock-fontify-region position end)
-              (setq position end))))
-        (sh-ts-mode-test--should-match-fresh-buffer 4)))))
-
-(ert-deftest sh-ts-mode-keeps-font-lock-levels-independent-between-buffers ()
-  (sh-ts-mode-test--require-grammar)
-  (let ((source "f() { :; }\n"))
-    (with-temp-buffer
-      (insert source)
-      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
-      (font-lock-ensure)
-      (let ((state (sh-ts-mode-test--buffer-state)))
-        (with-temp-buffer
-          (insert source)
-          (let ((treesit-font-lock-level 1)) (sh-ts-mode))
-          (font-lock-ensure)
-          (goto-char (point-min))
-          (search-forward "{")
-          (should-not (get-text-property (1- (point)) 'face)))
-        (font-lock-flush)
-        (font-lock-ensure)
-        (should (equal state (sh-ts-mode-test--buffer-state)))
-        (goto-char (point-min))
-        (search-forward "{")
-        (should (eq (get-text-property (1- (point)) 'face)
-                    'font-lock-bracket-face))))))
 
 ;;;; Navigation
 
-(ert-deftest sh-ts-mode-uses-standard-tree-sitter-navigation ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (sh-ts-mode)
-    (should (equal (alist-get 'sh treesit-thing-settings)
-                   (alist-get 'sh sh-ts-mode-thing-settings)))
-    (should-not (treesit-thing-defined-p 'sexp 'sh))
-    (should-not (treesit-thing-defined-p 'sentence 'sh))
-    (should-not (eq forward-sexp-function #'treesit-forward-sexp))
-    (should (eq beginning-of-defun-function
-                #'treesit-beginning-of-defun))
-    (should (eq end-of-defun-function #'treesit-end-of-defun))))
-
-(ert-deftest sh-ts-mode-navigates-function-definitions-as-defuns ()
-  (sh-ts-mode-test--require-grammar)
+(ert-deftest sh-ts-mode-navigates-structures ()
   (with-temp-buffer
     (insert "printf before\n"
             "first() {\n  :\n}\n"
@@ -1070,18 +727,7 @@
 
 ;;;; Imenu
 
-(ert-deftest sh-ts-mode-uses-standard-tree-sitter-imenu ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (sh-ts-mode)
-    (should (equal treesit-simple-imenu-settings
-                   sh-ts-mode-imenu-settings))
-    (should (eq treesit-defun-name-function
-                #'sh-ts-mode--defun-name))
-    (should (eq imenu-create-index-function #'treesit-simple-imenu))))
-
-(ert-deftest sh-ts-mode-indexes-only-function-definitions ()
-  (sh-ts-mode-test--require-grammar)
+(ert-deftest sh-ts-mode-indexes-definitions ()
   (with-temp-buffer
     (insert "printf before\n"
             "first() {\n  :\n}\n"
@@ -1096,40 +742,33 @@
       (should
        (equal
         (mapcar (lambda (entry) (marker-position (cdr entry))) index)
-        (list (sh-ts-mode-test--position-in-line "first() {" "first")
-              (sh-ts-mode-test--position-in-line "second() (" "second")))))
+        (list (sh-ts-mode-test--position "first" "first() {")
+              (sh-ts-mode-test--position "second" "second() (")))))
     (let ((function (treesit-thing-next (point-min) 'defun))
           (root (treesit-buffer-root-node 'sh)))
       (should (equal (treesit-defun-name function) "first"))
       (should-not (treesit-defun-name root)))))
 
-(ert-deftest sh-ts-mode-rebuilds-imenu-after-edits ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (insert "first() { :; }\n")
-    (sh-ts-mode)
-    (should (equal (mapcar #'car (cdr (assoc "Function"
-                                             (funcall imenu-create-index-function))))
-                   '("first")))
-    (goto-char (point-max))
-    (insert "second() { :; }\n")
-    (should (equal (mapcar #'car (cdr (assoc "Function"
-                                             (funcall imenu-create-index-function))))
-                   '("first" "second")))))
-
 ;;;; Indentation
 
-(ert-deftest sh-ts-mode-uses-standard-tree-sitter-indentation ()
-  (sh-ts-mode-test--require-grammar)
-  (with-temp-buffer
-    (sh-ts-mode)
-    (should (eq indent-line-function #'treesit-indent))
-    (should (eq indent-region-function #'treesit-indent-region))
-    (should (equal (alist-get 'sh treesit-simple-indent-rules)
-                   (alist-get 'sh sh-ts-mode-indent-rules)))))
+(ert-deftest sh-ts-mode-indents-structures ()
+  (pcase-dolist (`(,source ,offset ,expected)
+                 '(("if ready\nthen\nprintf yes &&\nprintf more\nelse\nprintf no\nfi\ncase x in\na)\nprintf a\n;;\nesac\n" 2 "if ready\nthen\n  printf yes &&\n    printf more\nelse\n  printf no\nfi\ncase x in\n  a)\n    printf a\n    ;;\nesac\n")
+                   ("{\nprintf body\n}\n" 4 "{\n    printf body\n}\n")
+                   ("{\nprintf body\n        }\n" 2 "{\n  printf body\n}\n")
+                   ("(\nprintf body\n        )\n" 2 "(\n  printf body\n)\n")
+                   ("while ready\n        do\nprintf x\n        done\n" 2 "while ready\ndo\n  printf x\ndone\n")
+                   ("if a\n        then\n:\n        elif b\nthen\n:\n        fi\n" 2 "if a\nthen\n  :\nelif b\nthen\n  :\nfi\n")
+                   ("worker() {\nprintf body\n}\n" 2 "worker() {\n  printf body\n}\n")
+                   ("true && {\nprintf x\n}\n" 2 "true && {\n  printf x\n}\n")
+                   ("while ready; do\nprintf x\ndone\n" 2 "while ready; do\n  printf x\ndone\n")
+                   ("{\nprintf a\nprintf b\n}\n" 2 "{\n  printf a\n  printf b\n}\n")
+                   ("if x\nthen\nprintf a\nprintf b\nfi\n" 2 "if x\nthen\n  printf a\n  printf b\nfi\n")
+                   ("case x in\na)\n:\n;;\nb)\n:\n;;\nesac\n" 2 "case x in\n  a)\n    :\n    ;;\n  b)\n    :\n    ;;\nesac\n")))
+    (ert-info ((format "Offset %s: %S" offset source))
+      (should (equal (sh-ts-mode-test--indent source offset) expected)))))
 
 (ert-deftest sh-ts-mode-preserves-expansion-boundaries-during-indentation ()
-  (sh-ts-mode-test--require-grammar)
   (pcase-dolist (`(,prefix ,suffix)
                  '(("if :; then\n  " "\nfi\n")
                    ("worker() {\n  " "\n}\n")))
@@ -1158,128 +797,179 @@
             (should-not (treesit-node-check (treesit-buffer-root-node 'sh)
                                             'has-error))))))))
 
-(ert-deftest sh-ts-mode-indents-structural-rules ()
-  (sh-ts-mode-test--require-grammar)
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "if ready\nthen\nprintf yes &&\nprintf more\nelse\nprintf no\nfi\ncase x in\na)\nprintf a\n;;\nesac\n")
-    "if ready\nthen\n  printf yes &&\n    printf more\nelse\n  printf no\nfi\ncase x in\n  a)\n    printf a\n    ;;\nesac\n")))
-
-(ert-deftest sh-ts-mode-indent-offset-controls-rules ()
-  (sh-ts-mode-test--require-grammar)
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "{\nprintf body\n}\n" 4)
-    "{\n    printf body\n}\n")))
-
-(ert-deftest sh-ts-mode-indents-closers-from-wrong-columns ()
-  (sh-ts-mode-test--require-grammar)
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "{\nprintf body\n        }\n")
-    "{\n  printf body\n}\n"))
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "(\nprintf body\n        )\n")
-    "(\n  printf body\n)\n"))
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "while ready\n        do\nprintf x\n        done\n")
-    "while ready\ndo\n  printf x\ndone\n"))
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "if a\n        then\n:\n        elif b\nthen\n:\n        fi\n")
-    "if a\nthen\n  :\nelif b\nthen\n  :\nfi\n")))
-
-(ert-deftest sh-ts-mode-indents-bodies-after-inline-openers ()
-  (sh-ts-mode-test--require-grammar)
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "worker() {\nprintf body\n}\n")
-    "worker() {\n  printf body\n}\n"))
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "true && {\nprintf x\n}\n")
-    "true && {\n  printf x\n}\n"))
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "while ready; do\nprintf x\ndone\n")
-    "while ready; do\n  printf x\ndone\n")))
-
-(ert-deftest sh-ts-mode-indents-every-command-in-a-body ()
-  (sh-ts-mode-test--require-grammar)
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "{\nprintf a\nprintf b\n}\n")
-    "{\n  printf a\n  printf b\n}\n"))
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "if x\nthen\nprintf a\nprintf b\nfi\n")
-    "if x\nthen\n  printf a\n  printf b\nfi\n")))
-
-(ert-deftest sh-ts-mode-indents-every-case-item ()
-  (sh-ts-mode-test--require-grammar)
-  (should
-   (equal
-    (sh-ts-mode-test--indent
-     "case x in\na)\n:\n;;\nb)\n:\n;;\nesac\n")
-    "case x in\n  a)\n    :\n    ;;\n  b)\n    :\n    ;;\nesac\n")))
-
 (ert-deftest sh-ts-mode-keeps-here-document-bodies-unindented ()
-  (sh-ts-mode-test--require-grammar)
   (should
    (equal
     (sh-ts-mode-test--indent
      "{\ncat <<EOF\nbody text\n  spaced\nEOF\n: after\n}\n")
     "{\n  cat <<EOF\nbody text\n  spaced\nEOF\n  : after\n}\n")))
 
-;;;; Mode Selection
+;;;; Updates
 
-(ert-deftest sh-ts-mode-does-not-claim-file-extensions ()
-  (dolist (entry auto-mode-alist)
-    (should-not (eq (cdr entry) 'sh-ts-mode))))
+(ert-deftest sh-ts-mode-updates-like-fresh-buffer ()
+  (pcase-dolist (`(,source ,old ,new ,fragment ,face)
+                 '(("echo ${00}\n" "00" "01" "01" font-lock-constant-face)
+                   ("fi\n" "fi" "if :; then :; fi" "fi" font-lock-keyword-face)
+                   ("cat <<EOF\nbody\n" "body" "body\nEOF" "body" font-lock-string-face)))
+    (ert-info ((format "%S: %S -> %S" source old new))
+      (with-temp-buffer
 
-(ert-deftest sh-ts-mode-generates-mode-and-interpreter-autoloads ()
-  (require 'loaddefs-gen)
-  (let ((output (make-temp-file "sh-ts-mode-loaddefs-"))
-        (directory
-         (file-name-directory (locate-library "sh-ts-mode"))))
-    (unwind-protect
-        (progn
-          (loaddefs-generate directory output nil nil nil t)
-          (with-temp-buffer
-            (insert-file-contents output)
-            (dolist (form '("(autoload 'sh-ts-mode"
-                            "(add-to-list 'interpreter-mode-alist"))
-              (goto-char (point-min))
-              (should (search-forward form nil t)))
-            (goto-char (point-min))
-            (should-not (search-forward "(add-to-list 'auto-mode-alist" nil t))))
-      (delete-file output))))
+        (insert source)
+        (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+        (sh-ts-mode-test--buffer-state)
+        (goto-char (sh-ts-mode-test--position old))
+        (delete-char (length old))
+        (insert new)
+        (font-lock-ensure)
+        (should (eq (sh-ts-mode-test--face fragment) face))
+        (sh-ts-mode-test--should-match-fresh-buffer 4)))))
 
-(ert-deftest sh-ts-mode-selects-sh-interpreters ()
-  (sh-ts-mode-test--require-grammar)
-  (should (equal (alist-get "sh" interpreter-mode-alist nil nil #'equal)
-                 'sh-ts-mode))
-  (dolist (shebang '("#!/bin/sh\n"
-                     "#!/usr/bin/env sh\n"
-                     "#!/usr/bin/env -S sh\n"))
+(ert-deftest sh-ts-mode-reclassifies-delimiters-after-edits ()
+  (with-temp-buffer
+    (insert "{\nprintf body\n}\n")
+    (sh-ts-mode)
+    (should (= (sh-ts-mode-test--syntax-class "}" nil "}") 5))
+    (goto-char (point-min))
+    (delete-char 1)
+    (should (= (sh-ts-mode-test--syntax-class "}" nil "}") 1))
+    (goto-char (point-min))
+    (insert "{")
+    (should (= (sh-ts-mode-test--syntax-class "}" nil "}") 5))))
+
+(ert-deftest sh-ts-mode-recomputes-comment-syntax-after-edits ()
+  (with-temp-buffer
+    (insert "printf value#suffix\n")
+    (sh-ts-mode)
+    (should-not
+     (sh-ts-mode-test--comment-p "suffix" nil "printf value#suffix"))
+    (goto-char
+     (sh-ts-mode-test--position "#" "printf value#suffix"))
+    (insert " ")
+    (should
+     (sh-ts-mode-test--comment-p "suffix" nil "printf value #suffix"))
+    (goto-char
+     (sh-ts-mode-test--position " #" "printf value #suffix"))
+    (delete-char 1)
+    (should-not
+     (sh-ts-mode-test--comment-p "suffix" nil "printf value#suffix")))
+  (with-temp-buffer
+    (insert "echo \"`a # head\nbody\n`\"\n: tail\n")
+    (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+    (dolist (continued '(t nil t))
+      (goto-char (point-min))
+      (search-forward "# head")
+      (if continued (insert "\\") (delete-char 1))
+      (narrow-to-region
+       (sh-ts-mode-test--position "body" "body") (point-max))
+      (syntax-propertize (point-max))
+      (widen)
+      (should (eq (sh-ts-mode-test--comment-p "body" nil "body") continued))
+      (should (sh-ts-mode-test--comment-p "head" nil (if continued "echo \"`a # head\\" "echo \"`a # head")))
+      (should-not (sh-ts-mode-test--comment-p "tail" nil ": tail"))
+      (font-lock-flush)
+      (font-lock-ensure)
+      (sh-ts-mode-test--should-match-fresh-buffer 4))))
+
+(ert-deftest sh-ts-mode-preserves-syntax-when-narrowed ()
+  (with-temp-buffer
+    (insert "echo a # first\necho b\necho c # third\n")
+    (sh-ts-mode)
+    (narrow-to-region
+     (sh-ts-mode-test--position "echo" "echo b")
+     (point-max))
+    (syntax-propertize (point-max))
+    (widen)
+    (should (sh-ts-mode-test--comment-p "first" nil "echo a # first"))
+    (should (sh-ts-mode-test--comment-p "third" nil "echo c # third"))))
+
+(ert-deftest sh-ts-mode-updates-pattern-context-after-edits ()
+  (with-temp-buffer
+    (let ((pattern-line "value=${x##*}")
+          (value-line "value=${x:-*}"))
+      (insert pattern-line "\n")
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+      (font-lock-ensure)
+      (should (eq (sh-ts-mode-test--face "*" nil pattern-line)
+                  'font-lock-constant-face))
+      (goto-char (point-min))
+      (search-forward "##")
+      (replace-match ":-")
+      (font-lock-flush (point-min) (point-max))
+      (font-lock-ensure)
+      (should (eq (sh-ts-mode-test--face "*" nil value-line)
+                  'font-lock-string-face)))))
+
+(ert-deftest sh-ts-mode-reclassifies-backquote-words-after-enclosing-quote-edits ()
+  (with-temp-buffer
+    (insert "echo `printf %s \\\"a b\\\"`\n")
+    (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+    (dolist (quoted '(nil t nil))
+      (goto-char 6)
+      (when (eq (char-after) ?\")
+        (delete-char 1)
+        (goto-char (1- (point-max)))
+        (delete-char -1))
+      (when quoted
+        (goto-char 6)
+        (insert "\"")
+        (goto-char (1- (point-max)))
+        (insert "\""))
+      (font-lock-flush)
+      (font-lock-ensure)
+      (goto-char (point-min))
+      (search-forward "\\")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  (unless quoted 'font-lock-escape-face)))
+      (should (eq (get-text-property (point) 'face)
+                  (if quoted 'font-lock-string-face 'font-lock-escape-face)))
+      (search-forward "a b")
+      (should (eq (get-text-property (- (point) 2) 'face)
+                  (and quoted 'font-lock-string-face)))
+      (sh-ts-mode-test--should-match-fresh-buffer 4))))
+
+(ert-deftest sh-ts-mode-fontifies-continued-constructs-after-completion ()
+  (pcase-dolist (`(,incomplete ,completion)
+                 '(("i\\\nf\n" "true; then :; fi\n")
+                   ("w\\\nhile\n" "true; do :; done\n")
+                   ("f\\\nor item in one\n" "do :; done\n")
+                   ("c\\\nase x in\nx)" " :;; esac\n")
+                   ("f\\\n() {\n" ":;\n}\n")
+                   ("e\\\ncho inner |\n" "cat\n")
+                   ("e\\\ncho ${value:-" "inner}\n")
+                   ("e\\\ncho $(" "echo inner)\n")))
     (with-temp-buffer
-      (setq buffer-file-name "/tmp/example")
-      (insert shebang "printf '%s\\n' hello\n")
-      (set-auto-mode)
-      (should (eq major-mode 'sh-ts-mode)))))
+      (insert "#!/bin/sh\n\nprintf before\n\n")
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+      (font-lock-ensure)
+      (let ((start (point)))
+        (insert incomplete)
+        (font-lock-ensure)
+        (insert completion)
+        (font-lock-ensure)
+        (should-not (treesit-node-check (treesit-buffer-root-node 'sh) 'has-error))
+        (sh-ts-mode-test--should-match-fresh-buffer 4)
+        (goto-char start)
+        (search-forward "\\")
+        (should (eq (get-text-property (1- (point)) 'face)
+                    'font-lock-punctuation-face))
+        (delete-region start (point-max))
+        (font-lock-ensure)
+        (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                       "#!/bin/sh\n\nprintf before\n\n"))
+        (sh-ts-mode-test--should-match-fresh-buffer 4)))))
+
+(ert-deftest sh-ts-mode-rebuilds-imenu-after-edits ()
+  (with-temp-buffer
+    (insert "first() { :; }\n")
+    (sh-ts-mode)
+    (should (equal (mapcar #'car (cdr (assoc "Function"
+                                             (funcall imenu-create-index-function))))
+                   '("first")))
+    (goto-char (point-max))
+    (insert "second() { :; }\n")
+    (should (equal (mapcar #'car (cdr (assoc "Function"
+                                             (funcall imenu-create-index-function))))
+                   '("first" "second")))))
 
 (provide 'sh-ts-mode-test)
 

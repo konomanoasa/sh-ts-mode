@@ -1,12 +1,12 @@
 # sh-ts-mode
 
-[![CI](https://github.com/konomanoasa/sh-ts-mode/actions/workflows/ci.yml/badge.svg)](https://github.com/konomanoasa/sh-ts-mode/actions/workflows/ci.yml)
+[![CI](https://github.com/konomanoasa/sh-ts-mode/actions/workflows/ci.yaml/badge.svg)](https://github.com/konomanoasa/sh-ts-mode/actions/workflows/ci.yaml)
 
 [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)-based
 [Emacs](https://www.gnu.org/software/emacs/) major mode for the
 POSIX.1-2024 Shell Command Language.
 
-## Requirements
+## Requirement
 
 - Emacs 31.1 or later
 
@@ -18,7 +18,7 @@ POSIX.1-2024 Shell Command Language.
 
 ## Automatic Activation
 
-Enabled for scripts with an `sh` shebang.
+Enabled for scripts with a `sh` shebang.
 
 ## Features
 
@@ -26,7 +26,7 @@ Enabled for scripts with an `sh` shebang.
 - Font Lock
 - Imenu: functions
 - Indentation
-- Navigation: `defun`
+- Navigation
 - Syntax Table
 
 ## Font Lock
