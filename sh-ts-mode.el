@@ -35,15 +35,28 @@
 ;;; Code:
 
 (require 'treesit)
+(require 'elec-pair)
 
 (defgroup sh-ts nil
   "Tree-sitter mode for POSIX sh."
   :group 'languages)
 
+;;;; Grammar
+
 (defconst sh-ts-mode--grammar-sources
   '((sh "https://github.com/konomanoasa/tree-sitter-sh"
-        :revision "v0.16.0"))
+        :revision "v0.18.0"))
   "Tree-sitter grammar sources for POSIX sh.")
+
+(defun sh-ts-mode--ensure-grammar (language)
+  "Ensure that the grammar for LANGUAGE is installed."
+  (let ((treesit-language-source-alist
+         (if (assq language treesit-language-source-alist)
+             treesit-language-source-alist
+           (cons (assq language sh-ts-mode--grammar-sources)
+                 treesit-language-source-alist))))
+    (or (treesit-ensure-installed language)
+        (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
 ;;;; Context
 
@@ -59,10 +72,11 @@
   '("cmd_name" "cmd_word" "cmd_suffix" "wordlist" "filename")
   "Node types that can own pathname patterns.")
 
-(defconst sh-ts-mode--pathname-pattern-types
-  '("pattern_bracket_source" "pattern_question_source"
-    "pattern_star_source")
-  "Node types that identify pathname patterns.")
+(defconst sh-ts-mode--pathname-pattern-regexp
+  (rx string-start
+      (or "pattern_bracket_source" "pattern_question_source" "pattern_star_source")
+      string-end)
+  "Regexp matching pathname pattern candidates.")
 
 (defconst sh-ts-mode--pattern-scope-types
   (append sh-ts-mode--pattern-context-types
@@ -81,53 +95,32 @@
       (setq index (1+ index)))
     (= index count)))
 
-(defun sh-ts-mode--ancestor-state (node inside-types outside-types)
-  "Return non-nil when NODE enters INSIDE-TYPES before OUTSIDE-TYPES."
-  (let (state)
-    (while (and node (not state))
-      (let ((type (treesit-node-type node)))
-        (cond
-         ((member type inside-types) (setq state 'inside))
-         ((member type outside-types) (setq state 'outside))))
-      (setq node (treesit-node-parent node)))
-    (eq state 'inside)))
-
-(defun sh-ts-mode--active-pattern-p (node)
-  "Return non-nil when NODE is inside an active shell pattern."
-  (sh-ts-mode--ancestor-state
-   node sh-ts-mode--pattern-context-types
-   sh-ts-mode--pattern-boundary-types))
-
 (defun sh-ts-mode--pathname-pattern-word-p (word)
   "Return non-nil when WORD contains a pathname pattern."
-  (let ((owner (treesit-node-parent word))
-        pending found)
-    (when (and owner
-               (member (treesit-node-type owner)
-                       sh-ts-mode--pathname-owner-types))
-      (setq pending (list word))
-      (while (and pending (not found))
-        (let* ((node (pop pending))
-               (type (treesit-node-type node)))
-          (cond
-           ((member type sh-ts-mode--pathname-pattern-types)
-            (setq found t))
-           ((member type sh-ts-mode--pattern-scope-types))
-           (t
-            (let ((index (1- (treesit-node-child-count node t))))
-              (while (>= index 0)
-                (push (treesit-node-child node index t) pending)
-                (setq index (1- index)))))))))
-    found))
+  (treesit-search-subtree
+   word
+   `(and ,sh-ts-mode--pathname-pattern-regexp
+         ,(lambda (node)
+            (let ((parent (treesit-node-parent node)))
+              (while (and parent
+                          (not (treesit-node-eq parent word))
+                          (not (member (treesit-node-type parent)
+                                       sh-ts-mode--pattern-scope-types)))
+                (setq parent (treesit-node-parent parent)))
+              (treesit-node-eq parent word))))))
 
-(defun sh-ts-mode--pathname-pattern-p (node)
-  "Return non-nil when NODE is inside a pathname pattern word."
+(defun sh-ts-mode--pattern-interior-p (node)
+  "Return non-nil when NODE is inside any shell pattern."
   (let (result)
     (while node
       (let ((parent (treesit-node-parent node))
             (type (treesit-node-type node)))
         (cond
-         ((member type sh-ts-mode--pattern-boundary-types)
+         ((member type sh-ts-mode--pattern-context-types)
+          (setq result t node nil))
+         ((or (member type sh-ts-mode--pattern-boundary-types)
+              (member type '("simple_command" "for_clause" "case_clause"
+                             "io_file" "io_here")))
           (setq node nil))
          ((and parent
                (equal type "word")
@@ -137,11 +130,6 @@
                 node nil))
          (t (setq node parent)))))
     result))
-
-(defun sh-ts-mode--pattern-interior-p (node)
-  "Return non-nil when NODE is inside any shell pattern."
-  (or (sh-ts-mode--active-pattern-p node)
-      (sh-ts-mode--pathname-pattern-p node)))
 
 (defun sh-ts-mode--outside-pattern-interior-p (node)
   "Return non-nil when NODE is outside every shell pattern."
@@ -197,11 +185,20 @@
 
 ;;;; Syntax
 
-(defvar sh-ts-mode-syntax-table
+(defvar sh-ts-mode-syntax--text-table
   (let ((table (make-syntax-table prog-mode-syntax-table)))
-    (dolist (character '(?# ?\" ?\\ ?\( ?\) ?\[ ?\] ?{ ?}))
+    (dolist (character '(?# ?$ ?' ?` ?\" ?\\ ?\( ?\) ?\[ ?\] ?{ ?}))
       (modify-syntax-entry character "." table))
     (modify-syntax-entry ?\n ">" table)
+    table)
+  "Syntax table for text without a CST syntax classification.")
+
+(defvar sh-ts-mode-syntax-table
+  (let ((table (copy-syntax-table sh-ts-mode-syntax--text-table)))
+    (dolist (entry '((?\( . "()") (?\) . ")(")
+                     (?\[ . "(]") (?\] . ")[")
+                     (?{ . "(}") (?} . "){")))
+      (modify-syntax-entry (car entry) (cdr entry) table))
     table)
   "Syntax table for `sh-ts-mode'.")
 
@@ -246,9 +243,9 @@
       (widen)
       (when (and (= start accessible-start)
                  (> accessible-start (point-min)))
-        (remove-text-properties (point-min) start '(syntax-table nil))
         (setq start (point-min))
         (syntax-ppss-flush-cache start))
+      (put-text-property start end 'syntax-table sh-ts-mode-syntax--text-table)
       (dolist (capture (treesit-query-capture
                         (treesit-parser-root-node treesit-primary-parser)
                         sh-ts-mode-syntax--query start end))
@@ -270,7 +267,7 @@
 
 ;;;;; Setup
 
-(defun sh-ts-mode-syntax-setup ()
+(defun sh-ts-mode-syntax--setup ()
   "Configure syntax handling for the current buffer."
   (setq-local syntax-propertize-function
               #'sh-ts-mode-syntax--propertize)
@@ -280,6 +277,42 @@
   (setq-local comment-end "")
   (setq-local comment-start-skip "#[[:blank:]]*")
   (setq-local comment-use-syntax t))
+
+;;;; Electric Pair
+
+(defun sh-ts-mode-electric-pair--newline-context-p ()
+  "Return non-nil for a multiline CST delimiter pair around the newline."
+  (when (and (eq (char-before) ?\n)
+             (>= (- (point) 2) (point-min))
+             (< (point) (point-max)))
+    (let* ((opening (treesit-node-at (- (point) 2) treesit-primary-parser))
+           (closing (treesit-node-at (point) treesit-primary-parser))
+           (owner (treesit-node-parent opening)))
+      (and (= (treesit-node-start opening) (- (point) 2))
+           (= (treesit-node-end opening) (1- (point)))
+           (= (treesit-node-start closing) (point))
+           (= (treesit-node-end closing) (1+ (point)))
+           (treesit-node-eq owner (treesit-node-parent closing))
+           (member (treesit-node-type owner)
+                   '("brace_group" "subshell" "command_substitution"
+                     "parenthesized_arithmetic"
+                     "parenthesized_arithmetic_source"
+                     "parenthesized_arithmetic_dynamic_source"))))))
+
+(defun sh-ts-mode-electric-pair--setup ()
+  "Configure electric pairing for the current buffer."
+  (let ((pairs '((?\( . ?\)) (?\[ . ?\]) (?{ . ?})))
+        (table (copy-syntax-table (syntax-table))))
+    (setq-local electric-pair-pairs (append electric-pair-pairs pairs))
+    (dolist (pair pairs)
+      (unless (eq (cdr (assq (car pair) electric-pair-pairs)) (cdr pair))
+        (modify-syntax-entry (car pair) "." table)))
+    (set-syntax-table table))
+  (let ((setting electric-pair-open-newline-between-pairs))
+    (setq-local electric-pair-open-newline-between-pairs
+                (lambda ()
+                  (and (if (functionp setting) (funcall setting) setting)
+                       (sh-ts-mode-electric-pair--newline-context-p))))))
 
 ;;;; Font Lock
 
@@ -421,9 +454,7 @@
              @font-lock-variable-name-face))
      ((parameter_expansion
        "$" @font-lock-variable-use-face
-       parameter: [(variable_name)
-                   (positional_parameter)
-                   (special_parameter)])
+       parameter: (_))
       (:pred sh-ts-mode--outside-pattern-interior-p
              @font-lock-variable-use-face))
      ((parameter_expansion
@@ -481,9 +512,7 @@
      ((pattern_equivalence_class_source
        "=" @font-lock-punctuation-face)
       (:pred sh-ts-mode--shell-pattern-source-p @font-lock-punctuation-face))
-     ((pattern_list
-       "|" @font-lock-operator-face)
-      (:pred sh-ts-mode--pattern-interior-p @font-lock-operator-face)))
+     (pattern_list "|" @font-lock-operator-face))
 
    :feature 'pattern
    '(((cmd_name (word (literal) @font-lock-function-call-face))
@@ -524,9 +553,7 @@
       (:pred sh-ts-mode--pattern-interior-p @font-lock-constant-face))
      ((parameter_expansion
        "$" @font-lock-variable-use-face
-       parameter: [(variable_name)
-                   (positional_parameter)
-                   (special_parameter)])
+       parameter: (_))
       (:pred sh-ts-mode--pattern-interior-p
              @font-lock-variable-use-face))
      ((parameter_expansion
@@ -613,7 +640,7 @@
 
 ;;;;; Setup
 
-(defun sh-ts-mode-font-lock-setup ()
+(defun sh-ts-mode-font-lock--setup ()
   "Configure font lock for the current buffer."
   (setq-local treesit-font-lock-feature-list
               sh-ts-mode-font-lock--feature-list)
@@ -622,40 +649,47 @@
 
 ;;;; Navigation
 
-(defconst sh-ts-mode--function-definition-regexp
+(defconst sh-ts-mode-navigation--function-definition-regexp
   "^function_definition$"
   "Regexp matching POSIX sh function definitions.")
 
-(defconst sh-ts-mode-thing-settings
+(defconst sh-ts-mode-navigation--settings
   `((sh
-     (defun ,sh-ts-mode--function-definition-regexp)))
+     (sexp ,(rx string-start
+                (or "word" "assignment_word" "name" "fname"
+                    "single_quoted" "double_quoted" "dollar_single_quoted"
+                    "parameter_expansion" "arithmetic_expansion"
+                    "command_substitution" "backquote_substitution"
+                    "compound_command" "function_definition")
+                string-end))
+     (defun ,sh-ts-mode-navigation--function-definition-regexp)))
   "Tree-sitter thing definitions for POSIX sh.")
 
-(defun sh-ts-mode-navigation-setup ()
+(defun sh-ts-mode-navigation--setup ()
   "Configure navigation for the current buffer."
   (setq-local treesit-thing-settings
-              sh-ts-mode-thing-settings))
+              sh-ts-mode-navigation--settings))
 
 ;;;; Imenu
 
-(defconst sh-ts-mode-imenu-settings
-  `(("Function" ,sh-ts-mode--function-definition-regexp nil nil))
-  "Tree-sitter Imenu settings for POSIX sh.")
-
-(defun sh-ts-mode--defun-name (node)
+(defun sh-ts-mode-imenu--name (node)
   "Return the source name of NODE, or nil if it has no name."
   (when (treesit-node-match-p
-         node sh-ts-mode--function-definition-regexp)
+         node sh-ts-mode-navigation--function-definition-regexp)
     (let ((name (treesit-node-child-by-field-name node "name")))
       (when (and name (equal (treesit-node-type name) "fname"))
         (treesit-node-text name t)))))
 
-(defun sh-ts-mode-imenu-setup ()
+(defconst sh-ts-mode-imenu--settings
+  `(("Function" ,sh-ts-mode-navigation--function-definition-regexp nil nil))
+  "Tree-sitter Imenu settings for POSIX sh.")
+
+(defun sh-ts-mode-imenu--setup ()
   "Configure Imenu for the current buffer."
   (setq-local treesit-defun-name-function
-              #'sh-ts-mode--defun-name)
+              #'sh-ts-mode-imenu--name)
   (setq-local treesit-simple-imenu-settings
-              sh-ts-mode-imenu-settings))
+              sh-ts-mode-imenu--settings))
 
 ;;;; Indentation
 
@@ -664,7 +698,7 @@
   :type 'natnum
   :group 'sh-ts)
 
-(defconst sh-ts-mode-indent-rules
+(defconst sh-ts-mode-indent--rules
   '((sh
      ((and (node-is "}") (parent-is "brace_group")) standalone-parent 0)
      ((and (node-is ")")
@@ -679,6 +713,12 @@
      ((node-is "case_list") parent-bol sh-ts-mode-indent-offset)
      ((node-is "case_item") parent-bol 0)
      ((field-is "terminator") parent-bol sh-ts-mode-indent-offset)
+     ((lambda (_node parent _bol)
+        (and (equal (treesit-node-type parent) "newline_list")
+             (equal (treesit-node-type
+                     (treesit-node-parent (treesit-node-parent parent)))
+                    "compound_list")))
+      standalone-parent sh-ts-mode-indent-offset)
      ((parent-is "compound_list") standalone-parent sh-ts-mode-indent-offset)
      ((parent-is "term") first-sibling 0)
      ((parent-is "and_or") parent-bol sh-ts-mode-indent-offset)
@@ -687,32 +727,23 @@
      ((parent-is "complete_commands") column-0 0)))
   "Tree-sitter indentation rules for POSIX sh.")
 
-(defun sh-ts-mode-indent-setup ()
+(defun sh-ts-mode-indent--setup ()
   "Configure indentation for the current buffer."
   (setq-local treesit-simple-indent-rules
-              sh-ts-mode-indent-rules))
+              sh-ts-mode-indent--rules))
 
 ;;;; Mode
-
-(defun sh-ts-mode--ensure-grammar (language)
-  "Ensure that the grammar for LANGUAGE is installed."
-  (let ((treesit-language-source-alist
-         (if (assq language treesit-language-source-alist)
-             treesit-language-source-alist
-           (cons (assq language sh-ts-mode--grammar-sources)
-                 treesit-language-source-alist))))
-    (or (treesit-ensure-installed language)
-        (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
 (defun sh-ts-mode--setup ()
   "Configure `sh-ts-mode' in the current buffer."
   (sh-ts-mode--ensure-grammar 'sh)
   (setq-local treesit-primary-parser (treesit-parser-create 'sh))
-  (sh-ts-mode-syntax-setup)
-  (sh-ts-mode-font-lock-setup)
-  (sh-ts-mode-navigation-setup)
-  (sh-ts-mode-imenu-setup)
-  (sh-ts-mode-indent-setup)
+  (sh-ts-mode-syntax--setup)
+  (sh-ts-mode-electric-pair--setup)
+  (sh-ts-mode-font-lock--setup)
+  (sh-ts-mode-navigation--setup)
+  (sh-ts-mode-imenu--setup)
+  (sh-ts-mode-indent--setup)
   (treesit-major-mode-setup))
 
 ;;;###autoload
@@ -721,6 +752,9 @@
   :syntax-table sh-ts-mode-syntax-table
   :group 'sh-ts
   (sh-ts-mode--setup))
+
+;;;###autoload
+(add-to-list 'auto-mode-alist '("\\.sh\\'" . sh-ts-mode))
 
 ;;;###autoload
 (add-to-list 'interpreter-mode-alist '("sh" . sh-ts-mode))

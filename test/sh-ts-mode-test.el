@@ -1,5 +1,26 @@
 ;;; sh-ts-mode-test.el --- Tests for sh-ts-mode  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 konomanoasa
+;;
+;; Permission is hereby granted, free of charge, to any person obtaining
+;; a copy of this software and associated documentation files (the
+;; "Software"), to deal in the Software without restriction, including
+;; without limitation the rights to use, copy, modify, merge, publish,
+;; distribute, sublicense, and/or sell copies of the Software, and to
+;; permit persons to whom the Software is furnished to do so, subject to
+;; the following conditions:
+;;
+;; The above copyright notice and this permission notice shall be
+;; included in all copies or substantial portions of the Software.
+;;
+;; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+;; EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+;; MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+;; NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+;; LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+;; OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+;; WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 ;;; Code:
 
 (require 'ert)
@@ -46,7 +67,7 @@
 (defun sh-ts-mode-test--should-have-faces (cases)
   (pcase-dolist (`(,line ,fragment ,face) cases)
     (ert-info ((format "%S: %S" line fragment))
-              (should (eq (sh-ts-mode-test--face fragment nil line) face)))))
+      (should (eq (sh-ts-mode-test--face fragment nil line) face)))))
 
 (defun sh-ts-mode-test--indent (source &optional offset)
   (with-temp-buffer
@@ -124,9 +145,14 @@
 
 ;;;; Mode Selection
 
-(ert-deftest sh-ts-mode-does-not-claim-file-extensions ()
-  (dolist (entry auto-mode-alist)
-    (should-not (eq (cdr entry) 'sh-ts-mode))))
+(ert-deftest sh-ts-mode-selects-files ()
+  (dolist (file '("/tmp/script.sh" "/tmp/script.sh.extra" "/tmp/script.bash"))
+    (with-temp-buffer
+      (setq buffer-file-name file)
+      (insert "printf hello\n")
+      (set-auto-mode)
+      (should (eq (eq major-mode 'sh-ts-mode)
+                  (equal file "/tmp/script.sh"))))))
 
 (ert-deftest sh-ts-mode-selects-interpreters ()
   (should (equal (alist-get "sh" interpreter-mode-alist nil nil #'equal)
@@ -148,7 +174,9 @@
           (loaddefs-generate directory output nil nil nil t)
           (with-temp-buffer
             (insert-file-contents output)
-            (dolist (form '("(autoload 'sh-ts-mode" "(add-to-list 'interpreter-mode-alist"))
+            (dolist (form '("(autoload 'sh-ts-mode"
+                            "(add-to-list 'auto-mode-alist"
+                            "(add-to-list 'interpreter-mode-alist"))
               (goto-char (point-min))
               (should (search-forward form nil t)))))
       (delete-file output))))
@@ -178,23 +206,23 @@
       (insert function "\n" literal "\n" expansions "\n" closing "\n"
               "case x in\n" parenthesized-case "\n" plain-case "\nesac\n")
       (sh-ts-mode)
-      (dolist (character '(?\( ?\) ?\[ ?\] ?{ ?}))
-        (should (eq (char-syntax character) ?.)))
+      (dolist (pair '((?\( . ?\)) (?\[ . ?\]) (?{ . ?})))
+        (should (eq (matching-paren (car pair)) (cdr pair))))
       (dolist (expectation
                `((,function "(" 0 4)
                  (,function ")" 0 5)
                  (,function "{" 0 4)
-                 (,expansions "${" 0 2)
+                 (,expansions "${" 0 1)
                  (,expansions "${" 1 4)
                  (,expansions "]]}" 2 5)
-                 (,expansions "$((" 0 2)
+                 (,expansions "$((" 0 1)
                  (,expansions "$((" 1 4)
                  (,expansions "$((" 2 4)
                  (,expansions "(2)" 0 4)
                  (,expansions "(2)" 2 5)
                  (,expansions "2)))" 2 5)
                  (,expansions "2)))" 3 5)
-                 (,expansions "$(printf" 0 2)
+                 (,expansions "$(printf" 0 1)
                  (,expansions "$(printf" 1 4)
                  (,expansions "x)\"" 1 5)
                  (,closing "}" 0 5)
@@ -213,6 +241,9 @@
                  (,literal "{}" 1)
                  (,literal "{fd}" 0)
                  (,literal "{fd}" 3)
+                 (,literal "'" 0)
+                 (,literal "\\n" 0)
+                 (,expansions "\"" 0)
                  (,expansions "[[" 0)
                  (,expansions "[[" 1)
                  (,expansions "]]" 0)
@@ -288,6 +319,106 @@
         (pcase-let ((`(,line ,fragment ,offset) expectation))
           (should-not
            (sh-ts-mode-test--comment-p fragment offset line)))))))
+
+;;;; Electric Pair
+
+(ert-deftest sh-ts-mode-opens-indented-line-between-braces ()
+  (pcase-dolist (`(,prefix ,suffix ,offset ,expand ,expected ,column)
+                 '(("func() " "" 2 t "func() {\n  \n}" 2)
+                   ("" "" 4 t "{\n    \n}" 4)
+                   ("{\n  " "\n}" 2 t
+                    "{\n  {\n    \n  }\n}" 4)
+                   ("func() " "" 2 nil "func() {\n}" 0)))
+    (ert-info ((format "Expand %S, offset %s: %S" expand offset prefix))
+      (let ((electric-pair-open-newline-between-pairs expand))
+        (with-temp-buffer
+          (insert prefix suffix)
+          (sh-ts-mode)
+          (setq-local indent-tabs-mode nil)
+          (setq-local sh-ts-mode-indent-offset offset)
+          (electric-indent-local-mode 1)
+          (electric-pair-local-mode 1)
+          (goto-char (1+ (length prefix)))
+          (let ((last-command-event ?{))
+            (self-insert-command 1))
+          (call-interactively (key-binding (kbd "RET")))
+          (should (equal (buffer-string) expected))
+          (should (= (current-column) column))
+          (when expand
+            (should (eolp))
+            (should (= (line-number-at-pos) (1+ (length (split-string prefix "\n")))))))))))
+
+(ert-deftest sh-ts-mode-restricts-pair-newlines-to-cst-contexts ()
+  (pcase-dolist (`(,before ,after ,expected)
+                 '(("{" "}" "{\n\n}")
+                   ("func() {" "}" "func() {\n\n}")
+                   ("(" ")" "(\n\n)")
+                   ("printf $(" ")" "printf $(\n\n)")
+                   ("printf ${name:-{" "}}" "printf ${name:-{\n}}")
+                   ("printf ${" "name}" "printf ${\nname}")
+                   ("func(" ") { :; }" "func(\n) { :; }")
+                   ("case x in (" ") :;; esac" "case x in (\n) :;; esac")
+                   ("printf [" "]" "printf [\n]")
+                   ("printf '{" "}'" "printf '{\n}'")
+                   ("printf \"(" ")\"" "printf \"(\n)\"")
+                   ("# {" "}" "# {\n}")
+                   ("cat <<EOF\n{" "}\nEOF\n" "cat <<EOF\n{\n}\nEOF\n")))
+    (ert-info ((format "%S / %S" before after))
+      (let ((electric-pair-open-newline-between-pairs t))
+        (with-temp-buffer
+          (insert before after)
+          (sh-ts-mode)
+          (electric-indent-local-mode -1)
+          (electric-pair-local-mode 1)
+          (goto-char (1+ (length before)))
+          (call-interactively (key-binding (kbd "RET")))
+          (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                         expected)))))))
+
+(ert-deftest sh-ts-mode-respects-pair-newline-preferences ()
+  (dolist (enabled '(nil t))
+    (let* ((calls 0)
+           (setting (lambda () (setq calls (1+ calls)) enabled))
+           (electric-pair-open-newline-between-pairs setting))
+      (with-temp-buffer
+        (insert "{}")
+        (sh-ts-mode)
+        (electric-indent-local-mode -1)
+        (electric-pair-local-mode 1)
+        (goto-char 2)
+        (call-interactively (key-binding (kbd "RET")))
+        (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                       (if enabled "{\n\n}" "{\n}")))
+        (should (> calls 0)))
+      (should (eq electric-pair-open-newline-between-pairs setting)))))
+
+(ert-deftest sh-ts-mode-supplies-electric-pairs ()
+  (let ((electric-pair-pairs '((?\" . ?\")))
+        (electric-pair-mode nil))
+    (pcase-dolist (`(,source ,character ,expected)
+                   '(("" ?{ "{}")
+                     ("" ?\( "()")
+                     ("printf " ?\[ "printf []")))
+      (with-temp-buffer
+        (insert source)
+        (sh-ts-mode)
+        (should-not electric-pair-mode)
+        (should (local-variable-p 'electric-pair-pairs))
+        (electric-pair-local-mode 1)
+        (let ((last-command-event character))
+          (self-insert-command 1))
+        (should (equal (buffer-string) expected))
+        (should (= (point) (1- (point-max))))))
+    (should (equal electric-pair-pairs '((?\" . ?\")))))
+  (let ((electric-pair-pairs '((?{ . ?>))))
+    (with-temp-buffer
+      (sh-ts-mode)
+      (should (equal (assq ?{ electric-pair-pairs) '(?{ . ?>)))
+      (electric-pair-local-mode 1)
+      (let ((last-command-event ?{))
+        (self-insert-command 1))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "{>")))))
 
 ;;;; Font Lock
 
@@ -725,6 +856,77 @@
                     (line-beginning-position 0) (point))
                    "}\n"))))
 
+
+(ert-deftest sh-ts-mode-navigates-cst-sexps ()
+  (dolist (case '(("" "printf" " value\n")
+                  ("printf " "foo${bar}" " tail\n")
+                  ("printf " "'two words'" " tail\n")
+                  ("printf " "\"$name\"" " tail\n")
+                  ("printf " "$'two words'" " tail\n")
+                  ("printf pre" "${value:-other}" "post\n")
+                  ("printf pre" "$(printf value)" "post\n")
+                  ("printf pre" "`printf value`" "post\n")
+                  ("printf pre" "$((1 + 2))" "post\n")
+                  ("" "name=two" " printf value\n")
+                  ("for " "item" " in one; do :; done\n")
+                  ("printf before\n" "if :; then :; else :; fi" "\nprintf after\n")
+                  ("printf before\n" "for x in a; do :; done" "\nprintf after\n")
+                  ("printf before\n" "while :; do :; done" "\nprintf after\n")
+                  ("printf before\n" "until :; do :; done" "\nprintf after\n")
+                  ("printf before\n" "case x in x) :;; esac" "\nprintf after\n")
+                  ("printf before\n" "{ :; }" "\nprintf after\n")
+                  ("printf before\n" "( : )" "\nprintf after\n")
+                  ("printf before\n" "worker() { :; }" "\nprintf after\n")
+                  ("printf " "va\\\nlue" " tail\n")))
+    (pcase-let ((`(,prefix ,unit ,suffix) case))
+      (ert-info ((format "%S" case))
+        (with-temp-buffer
+          (insert prefix unit suffix)
+          (sh-ts-mode)
+          (should-not (treesit-node-check (treesit-buffer-root-node 'sh) 'has-error))
+          (should (eq forward-sexp-function #'treesit-forward-sexp))
+          (let ((start (1+ (length prefix)))
+                (end (1+ (+ (length prefix) (length unit)))))
+            (goto-char start)
+            (forward-sexp)
+            (should (= (point) end))
+            (backward-sexp)
+            (should (= (point) start))))))))
+
+(ert-deftest sh-ts-mode-navigates-sexps-across-comments-and-after-edits ()
+  (with-temp-buffer
+    (insert "printf one # comment\nprintf two\n")
+    (sh-ts-mode)
+    (goto-char (point-min))
+    (forward-sexp 4)
+    (should (= (point) (1- (point-max))))
+    (backward-sexp 4)
+    (should (= (point) (point-min)))
+    (search-forward "one")
+    (replace-match "foo${bar}" t t)
+    (backward-sexp)
+    (should (= (point) 8))
+    (forward-sexp)
+    (should (= (point) 17))))
+
+(ert-deftest sh-ts-mode-navigates-nested-sexp-boundaries ()
+  (pcase-dolist (`(,source ,start ,direction ,expected)
+                 '(("printf pre${value}post\n" 8 1 23)
+                   ("printf pre${value}post\n" 23 -1 8)
+                   ("printf pre${value}post\n" 11 1 19)
+                   ("printf pre${value}post\n" 19 -1 11)
+                   ("printf pre${value}post\n" 15 1 19)
+                   ("printf pre${value}post\n" 15 -1 11)
+                   ("printf pre${value}\n" 11 1 19)
+                   ("printf pre${value}\n" 19 -1 8)))
+    (ert-info ((format "%S from %s by %s" source start direction))
+      (with-temp-buffer
+        (insert source)
+        (sh-ts-mode)
+        (goto-char start)
+        (forward-sexp direction)
+        (should (= (point) expected))))))
+
 ;;;; Imenu
 
 (ert-deftest sh-ts-mode-indexes-definitions ()
@@ -749,7 +951,48 @@
       (should (equal (treesit-defun-name function) "first"))
       (should-not (treesit-defun-name root)))))
 
+(ert-deftest sh-ts-mode-keeps-imenu-source-spelling-and-duplicate-names ()
+  (with-temp-buffer
+    (insert "same() { :; }\nsa\\\nme() { :; }\nsame() { :; }\n")
+    (sh-ts-mode)
+    (let ((entries (cdr (assoc "Function" (funcall imenu-create-index-function)))))
+      (should (equal (mapcar #'car entries) '("same" "sa\\\nme" "same")))
+      (should (equal (mapcar (lambda (entry) (marker-position (cdr entry))) entries)
+                     '(1 15 31))))))
+
 ;;;; Indentation
+
+(ert-deftest sh-ts-mode-indents-after-return ()
+  (pcase-dolist (`(,source ,line ,offset ,expected)
+                 '(("worker() {\n  :\n}" 0 2 "worker() {\n  \n  :\n}")
+                   ("if :; then\n  :\nfi" 0 2 "if :; then\n  \n  :\nfi")
+                   ("while :; do\n  :\ndone" 0 2 "while :; do\n  \n  :\ndone")
+                   ("{\n  :\n}" 1 2 "{\n  :\n  \n}")
+                   ("if :; then\n  :\nelse\n  :\nfi" 2 2 "if :; then\n  :\nelse\n  \n  :\nfi")
+                   ("case x in\n  a)\n    :;;\nesac" 1 2 "case x in\n  a)\n    \n    :;;\nesac")
+                   ("{\n  {\n    :\n  }\n}" 1 2 "{\n  {\n    \n    :\n  }\n}")
+                   ("{\n  {\n    :\n  }\n}" 3 2 "{\n  {\n    :\n  }\n  \n}")
+                   ("{\n  {\n    {\n      :\n    }\n  }\n}" 4 2 "{\n  {\n    {\n      :\n    }\n    \n  }\n}")
+                   ("{\n  {\n    :\n  } # done\n}" 3 2 "{\n  {\n    :\n  } # done\n  \n}")
+                   ("{\n    {\n        :\n    }\n}" 3 4 "{\n    {\n        :\n    }\n    \n}")
+                   ("{\n  if :; then\n    :\n  fi\n}" 3 2 "{\n  if :; then\n    :\n  fi\n  \n}")
+                   ("{\n  while :; do\n    :\n  done\n}" 3 2 "{\n  while :; do\n    :\n  done\n  \n}")
+                   ("{\n  :\n}" 2 2 "{\n  :\n}\n")
+                   ("{\n    :\n}" 0 4 "{\n    \n    :\n}")
+                   (":\n:" 0 2 ":\n\n:")
+                   ("cat <<EOF\ntext\nEOF" 1 2 "cat <<EOF\ntext\n\nEOF")))
+    (ert-info ((format "Return on line %s: %S" line source))
+      (with-temp-buffer
+        (insert source)
+        (sh-ts-mode)
+        (setq-local indent-tabs-mode nil)
+        (setq-local sh-ts-mode-indent-offset offset)
+        (electric-indent-local-mode 1)
+        (goto-char (point-min))
+        (forward-line line)
+        (end-of-line)
+        (call-interactively (key-binding (kbd "RET")))
+        (should (equal (buffer-string) expected))))))
 
 (ert-deftest sh-ts-mode-indents-structures ()
   (pcase-dolist (`(,source ,offset ,expected)
@@ -805,6 +1048,38 @@
     "{\n  cat <<EOF\nbody text\n  spaced\nEOF\n  : after\n}\n")))
 
 ;;;; Updates
+
+(ert-deftest sh-ts-mode-keeps-commands-after-closed-here-document-substitutions ()
+  (dolist (source '("x=$(cat <<EOF)\nhi\nEOF\n"
+                    "x=`cat <<EOF`\nhi\nEOF\n"))
+    (with-temp-buffer
+      (insert source)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+      (font-lock-ensure)
+      (should-not (treesit-node-check (treesit-buffer-root-node 'sh) 'has-error))
+      (dolist (command '("hi" "EOF"))
+        (should (eq (sh-ts-mode-test--face command nil command)
+                    'font-lock-function-call-face))))))
+
+(ert-deftest sh-ts-mode-restores-continued-closing-keywords-after-body-repair ()
+  (pcase-dolist (`(,prefix ,suffix)
+                 '(("" "") ("cat <<END\n$(\n" ")\nEND\n")))
+    (pcase-dolist (`(,header ,ending)
+                   '(("if true; then\n" "f\\\ni\n")
+                     ("while true; do\n" "do\\\nne\n")))
+      (with-temp-buffer
+        (insert prefix header ":\n" ending suffix)
+        (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+        (font-lock-ensure)
+        (goto-char (+ (point-min) (length prefix) (length header)))
+        (delete-char 2)
+        (font-lock-ensure)
+        (insert ":\n")
+        (font-lock-ensure)
+        (should-not (treesit-node-check (treesit-buffer-root-node 'sh) 'has-error))
+        (should (eq (sh-ts-mode-test--face ending) 'font-lock-keyword-face))
+        (should (eq (sh-ts-mode-test--face "\\") 'font-lock-punctuation-face))
+        (sh-ts-mode-test--should-match-fresh-buffer 4)))))
 
 (ert-deftest sh-ts-mode-updates-like-fresh-buffer ()
   (pcase-dolist (`(,source ,old ,new ,fragment ,face)
