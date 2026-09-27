@@ -191,7 +191,7 @@
           (with-temp-buffer
             (insert-file-contents output)
             (dolist (form '("(autoload 'sh-ts-mode"
-                            "(autoload 'sh-ts-mode--auto-mode"
+                            "(autoload 'sh-ts-mode-auto-mode"
                             "(add-to-list 'auto-mode-alist"
                             "(add-to-list 'interpreter-mode-alist"))
               (goto-char (point-min))

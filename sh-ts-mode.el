@@ -809,19 +809,19 @@ Pass ARG to `uncomment-region-default'."
   (sh-ts-mode--setup))
 
 ;;;###autoload
-(defun sh-ts-mode--auto-mode ()
+(defun sh-ts-mode-auto-mode ()
   "Select a major mode for a .sh file, respecting its shebang."
   (if (save-excursion
         (goto-char (point-min))
         (looking-at-p "#!"))
       (let ((auto-mode-alist
-             (rassq-delete-all #'sh-ts-mode--auto-mode
+             (rassq-delete-all #'sh-ts-mode-auto-mode
                                (copy-alist auto-mode-alist))))
         (set-auto-mode))
     (sh-ts-mode)))
 
 ;;;###autoload
-(add-to-list 'auto-mode-alist '("\\.sh\\'" . sh-ts-mode--auto-mode))
+(add-to-list 'auto-mode-alist '("\\.sh\\'" . sh-ts-mode-auto-mode))
 
 ;;;###autoload
 (add-to-list 'interpreter-mode-alist '("sh" . sh-ts-mode))
