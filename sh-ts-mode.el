@@ -34,8 +34,9 @@
 
 ;;; Code:
 
-(require 'treesit)
 (require 'elec-pair)
+(require 'newcomment)
+(require 'treesit)
 
 (defgroup sh-ts nil
   "Tree-sitter mode for POSIX sh."
@@ -236,6 +237,26 @@
     (?{ (string-to-syntax "(}"))
     (?} (string-to-syntax "){"))))
 
+(defvar-local sh-ts-mode-syntax--changed-start nil
+  "Earliest pending syntax change reported by the parser.")
+
+(defun sh-ts-mode-syntax--changed (ranges _parser)
+  "Invalidate syntax properties for the parser's changed RANGES."
+  (dolist (range ranges)
+    (setq sh-ts-mode-syntax--changed-start
+          (min (or sh-ts-mode-syntax--changed-start (car range))
+               (car range))))
+  (when sh-ts-mode-syntax--changed-start
+    (syntax-ppss-flush-cache sh-ts-mode-syntax--changed-start)))
+
+(defun sh-ts-mode-syntax--extend-region (start end)
+  "Extend START and END to include pending structural changes."
+  (treesit-parser-root-node treesit-primary-parser)
+  (let ((begin sh-ts-mode-syntax--changed-start))
+    (setq sh-ts-mode-syntax--changed-start nil)
+    (when (and begin (< begin start))
+      (cons (max (point-min) begin) end))))
+
 (defun sh-ts-mode-syntax--propertize (start end)
   "Apply syntax properties between START and END."
   (let ((accessible-start (point-min)))
@@ -269,14 +290,32 @@
 
 (defun sh-ts-mode-syntax--setup ()
   "Configure syntax handling for the current buffer."
+  (treesit-parser-add-notifier treesit-primary-parser #'sh-ts-mode-syntax--changed)
   (setq-local syntax-propertize-function
               #'sh-ts-mode-syntax--propertize)
   (add-hook 'syntax-propertize-extend-region-functions
             #'syntax-propertize-wholelines nil t)
+  (add-hook 'syntax-propertize-extend-region-functions
+            #'sh-ts-mode-syntax--extend-region t t))
+
+;;;; Comment Commands
+
+(defun sh-ts-mode-comment--uncomment-region (beg end &optional arg)
+  "Uncomment BEG through END using syntax classified before editing.
+Pass ARG to `uncomment-region-default'."
+  (syntax-propertize end)
+  (unwind-protect
+      (let ((syntax-propertize-function nil))
+        (uncomment-region-default beg end arg))
+    (syntax-ppss-flush-cache beg)))
+
+(defun sh-ts-mode-comment--setup ()
+  "Configure comment commands for the current buffer."
   (setq-local comment-start "# ")
   (setq-local comment-end "")
   (setq-local comment-start-skip "#[[:blank:]]*")
-  (setq-local comment-use-syntax t))
+  (setq-local comment-use-syntax t)
+  (setq-local uncomment-region-function #'sh-ts-mode-comment--uncomment-region))
 
 ;;;; Electric Pair
 
@@ -301,7 +340,8 @@
 
 (defun sh-ts-mode-electric-pair--setup ()
   "Configure electric pairing for the current buffer."
-  (let ((pairs '((?\( . ?\)) (?\[ . ?\]) (?{ . ?})))
+  (let ((pairs '((?\( . ?\)) (?\[ . ?\]) (?{ . ?})
+                 (?\" . ?\") (?\' . ?\') (?` . ?`)))
         (table (copy-syntax-table (syntax-table))))
     (setq-local electric-pair-pairs (append electric-pair-pairs pairs))
     (dolist (pair pairs)
@@ -698,6 +738,19 @@
   :type 'natnum
   :group 'sh-ts)
 
+(defun sh-ts-mode-indent--substitution (_node parent _bol)
+  "Return the indentation for command substitution content in PARENT."
+  (while (member (treesit-node-type parent)
+                 '("newline_list" "linebreak" "complete_commands"))
+    (setq parent (treesit-node-parent parent)))
+  (when (member (treesit-node-type parent)
+                '("command_substitution_body" "backquote_substitution_body"))
+    (cons (save-excursion
+            (goto-char (treesit-node-start (treesit-node-parent parent)))
+            (back-to-indentation)
+            (point))
+          sh-ts-mode-indent-offset)))
+
 (defconst sh-ts-mode-indent--rules
   '((sh
      ((and (node-is "}") (parent-is "brace_group")) standalone-parent 0)
@@ -713,11 +766,12 @@
      ((node-is "case_list") parent-bol sh-ts-mode-indent-offset)
      ((node-is "case_item") parent-bol 0)
      ((field-is "terminator") parent-bol sh-ts-mode-indent-offset)
+     sh-ts-mode-indent--substitution
      ((lambda (_node parent _bol)
         (and (equal (treesit-node-type parent) "newline_list")
-             (equal (treesit-node-type
-                     (treesit-node-parent (treesit-node-parent parent)))
-                    "compound_list")))
+             (member (treesit-node-type
+                      (treesit-node-parent (treesit-node-parent parent)))
+                     '("compound_list" "pipe_sequence" "and_or"))))
       standalone-parent sh-ts-mode-indent-offset)
      ((parent-is "compound_list") standalone-parent sh-ts-mode-indent-offset)
      ((parent-is "term") first-sibling 0)
@@ -739,6 +793,7 @@
   (sh-ts-mode--ensure-grammar 'sh)
   (setq-local treesit-primary-parser (treesit-parser-create 'sh))
   (sh-ts-mode-syntax--setup)
+  (sh-ts-mode-comment--setup)
   (sh-ts-mode-electric-pair--setup)
   (sh-ts-mode-font-lock--setup)
   (sh-ts-mode-navigation--setup)
@@ -754,7 +809,19 @@
   (sh-ts-mode--setup))
 
 ;;;###autoload
-(add-to-list 'auto-mode-alist '("\\.sh\\'" . sh-ts-mode))
+(defun sh-ts-mode--auto-mode ()
+  "Select a major mode for a .sh file, respecting its shebang."
+  (if (save-excursion
+        (goto-char (point-min))
+        (looking-at-p "#!"))
+      (let ((auto-mode-alist
+             (rassq-delete-all #'sh-ts-mode--auto-mode
+                               (copy-alist auto-mode-alist))))
+        (set-auto-mode))
+    (sh-ts-mode)))
+
+;;;###autoload
+(add-to-list 'auto-mode-alist '("\\.sh\\'" . sh-ts-mode--auto-mode))
 
 ;;;###autoload
 (add-to-list 'interpreter-mode-alist '("sh" . sh-ts-mode))

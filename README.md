@@ -18,7 +18,7 @@ Emacs 31.1 or later.
 
 ## Automatic Activation
 
-Enabled for `.sh` files and scripts with a `sh` shebang.
+Enabled for `.sh` files without a shebang and scripts with a `sh` shebang.
 
 ## Features
 
