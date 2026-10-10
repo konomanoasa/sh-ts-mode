@@ -46,7 +46,7 @@
 
 (defconst sh-ts-mode--grammar-sources
   '((sh "https://github.com/konomanoasa/tree-sitter-sh"
-        :revision "v0.18.0"))
+        :revision "v0.19.0"))
   "Tree-sitter grammar sources for POSIX sh.")
 
 (defun sh-ts-mode--ensure-grammar (language)
@@ -66,7 +66,7 @@
   "Node types that enter active shell patterns.")
 
 (defconst sh-ts-mode--pattern-boundary-types
-  '("command_substitution_body" "backquote_substitution_body")
+  '("command_substitution_body" "backquote_substitution_body" "assignment_value")
   "Node types that leave active shell patterns.")
 
 (defconst sh-ts-mode--pathname-owner-types
@@ -488,6 +488,10 @@ Pass ARG to `uncomment-region-default'."
        name: (variable_name) @font-lock-variable-name-face)
       (:pred sh-ts-mode--outside-pattern-interior-p
              @font-lock-variable-name-face))
+     ((word
+       name: (variable_name) @font-lock-variable-name-face)
+      (:pred sh-ts-mode--outside-pattern-interior-p
+             @font-lock-variable-name-face))
      ((for_clause
        name: (name) @font-lock-variable-name-face)
       (:pred sh-ts-mode--outside-pattern-interior-p
@@ -611,6 +615,9 @@ Pass ARG to `uncomment-region-default'."
 
    :feature 'operator
    '((assignment_word
+      "=" @font-lock-operator-face)
+     (word
+      name: (variable_name)
       "=" @font-lock-operator-face)
      [(and_if)
       (arithmetic_operator)

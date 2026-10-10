@@ -539,6 +539,18 @@
          (,redirection ">&" font-lock-operator-face)
          ("  fi" "fi" font-lock-keyword-face))))))
 
+(ert-deftest sh-ts-mode-keeps-arithmetic-source-fragments-unfontified ()
+  (with-temp-buffer
+    (insert "echo $((0x${y} + 1))\n")
+    (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+    (font-lock-ensure)
+    (should-not (treesit-node-check (treesit-buffer-root-node) 'has-error))
+    (should-not (sh-ts-mode-test--face "0x"))
+    (should-not (sh-ts-mode-test--face "0x" 1))
+    (should (eq (sh-ts-mode-test--face "y") 'font-lock-variable-use-face))
+    (should (eq (sh-ts-mode-test--face "+") 'font-lock-operator-face))
+    (should (eq (sh-ts-mode-test--face "1") 'font-lock-number-face))))
+
 (ert-deftest sh-ts-mode-fontifies-parameters-and-expansion-syntax ()
   (with-temp-buffer
     (let ((variable "printf \"$name ${name}\"")
@@ -929,6 +941,9 @@
                    ("printf pre" "`printf value`" "post\n")
                    ("printf pre" "$((1 + 2))" "post\n")
                    ("" "name=two" " printf value\n")
+                   ("readonly " "x=sh" "\n")
+                   ("command export " "y=\"$v\"" "\n")
+                   ("export x=\"" "${v}" "\"\n")
                    ("for " "item" " in one; do :; done\n")
                    ("printf before\n" "if :; then :; else :; fi" "\nprintf after\n")
                    ("printf before\n" "for x in a; do :; done" "\nprintf after\n")
@@ -1191,9 +1206,51 @@
         (should (eq (sh-ts-mode-test--face "\\") 'font-lock-punctuation-face))
         (sh-ts-mode-test--should-match-fresh-buffer 4)))))
 
+(ert-deftest sh-ts-mode-highlights-declaration-words-and-their-value-context ()
+  (with-temp-buffer
+    (insert "readonly x=[a-z]* y=~\n"
+            "command export z=\"$v\"\n"
+            "command -- export q=sh\n")
+    (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+    (font-lock-ensure)
+    (sh-ts-mode-test--should-have-faces
+     '(("readonly x=[a-z]* y=~" "readonly" font-lock-function-call-face)
+       ("readonly x=[a-z]* y=~" "x" font-lock-variable-name-face)
+       ("readonly x=[a-z]* y=~" "=" font-lock-operator-face)
+       ("readonly x=[a-z]* y=~" "[" font-lock-string-face)
+       ("readonly x=[a-z]* y=~" "*" font-lock-string-face)
+       ("readonly x=[a-z]* y=~" "y=" font-lock-variable-name-face)
+       ("readonly x=[a-z]* y=~" "~" font-lock-constant-face)
+       ("command export z=\"$v\"" "export" font-lock-string-face)
+       ("command export z=\"$v\"" "z" font-lock-variable-name-face)
+       ("command export z=\"$v\"" "v" font-lock-variable-use-face)
+       ("command -- export q=sh" "q=sh" font-lock-string-face)))))
+
+(ert-deftest sh-ts-mode-reclassifies-declaration-values-after-command-edits ()
+  (with-temp-buffer
+    (insert "export x=[a-z]*\n")
+    (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+    (font-lock-ensure)
+    (pcase-dolist (`(,old ,new ,name-face ,operator-face ,bracket-face)
+                   '(("export" "printf" font-lock-string-face
+                      font-lock-string-face font-lock-bracket-face)
+                     ("printf" "export" font-lock-variable-name-face
+                      font-lock-operator-face font-lock-string-face)))
+      (goto-char (point-min))
+      (search-forward old)
+      (replace-match new t t)
+      (font-lock-ensure)
+      (should (eq (sh-ts-mode-test--face "x=") name-face))
+      (should (eq (sh-ts-mode-test--face "=") operator-face))
+      (should (eq (sh-ts-mode-test--face "[") bracket-face))
+      (sh-ts-mode-test--should-match-fresh-buffer 4))))
+
 (ert-deftest sh-ts-mode-updates-like-fresh-buffer ()
   (pcase-dolist (`(,source ,old ,new ,fragment ,face)
                  '(("echo ${00}\n" "00" "01" "01" font-lock-constant-face)
+                   ("echo $((0x${y} + 1))\n" "0x${y}" "0x1" "0x1"
+                    font-lock-number-face)
+                   ("echo $((0x1 + 1))\n" "0x1" "0x${y}" "0x" nil)
                    ("fi\n" "fi" "if :; then :; fi" "fi" font-lock-keyword-face)
                    ("cat <<EOF\nbody\n" "body" "body\nEOF" "body" font-lock-string-face)))
     (ert-info ((format "%S: %S -> %S" source old new))

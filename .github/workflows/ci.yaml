@@ -29,8 +29,8 @@ jobs:
       - name: Build Emacs 31.1
         if: steps.emacs-cache.outputs.cache-hit != 'true'
         run: |
-          archive=/tmp/emacs-31.1.tar.xz
-          source_directory=$(mktemp -d)
+          readonly archive=/tmp/emacs-31.1.tar.xz
+          readonly source_directory=$(mktemp -d)
           curl --fail --location --silent --show-error \
             https://ftp.gnu.org/gnu/emacs/emacs-31.1.tar.xz \
             --output "$archive"
@@ -38,7 +38,7 @@ jobs:
             | shasum -a 256 --check
           tar -xf "$archive" -C "$source_directory" --strip-components=1
           cd "$source_directory"
-          PKG_CONFIG_PATH="$(brew --prefix tree-sitter)/lib/pkgconfig:$(brew --prefix gnutls)/lib/pkgconfig"
+          readonly PKG_CONFIG_PATH="$(brew --prefix tree-sitter)/lib/pkgconfig:$(brew --prefix gnutls)/lib/pkgconfig"
           export PKG_CONFIG_PATH
           ./configure \
             --prefix="$HOME/.local/emacs-31.1" \
@@ -53,7 +53,7 @@ jobs:
 
       - name: Check
         run: |
-          emacs="$HOME/.local/emacs-31.1/bin/emacs"
+          readonly emacs="$HOME/.local/emacs-31.1/bin/emacs"
           mkdir -p "$RUNNER_TEMP/emacs.d"
           "$emacs" -Q --batch \
             --eval "(setq user-emacs-directory \"$RUNNER_TEMP/emacs.d/\" package-user-dir \"$RUNNER_TEMP/emacs.d/elpa\")" \
