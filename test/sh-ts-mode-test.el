@@ -35,6 +35,22 @@
 
 ;;;; Helpers
 
+(defmacro sh-ts-mode-test--with-file (file properties source &rest body)
+  "Evaluate BODY with SOURCE in FILE using EditorConfig PROPERTIES."
+  (declare (indent 3) (debug (form form form body)))
+  `(let ((default-directory
+          (file-name-as-directory (make-temp-file "sh-ts-mode-" t))))
+     (unwind-protect
+         (progn
+           (with-temp-file (expand-file-name ".editorconfig")
+             (insert "root = true\n[*]\n" ,properties))
+           (with-temp-buffer
+             (setq buffer-file-name (expand-file-name ,file))
+             (insert ,source)
+             (sh-ts-mode)
+             ,@body))
+       (delete-directory default-directory t))))
+
 (defun sh-ts-mode-test--position (fragment &optional line)
   (save-excursion
     (goto-char (point-min))
@@ -91,15 +107,22 @@
         (push (list (get-text-property position 'face) (syntax-after position)) state)))
     (nreverse state)))
 
-(defun sh-ts-mode-test--should-match-fresh-buffer (level)
+(defun sh-ts-mode-test--should-match-fresh-buffer (&optional level compare-tree)
+  "Compare classifications at LEVEL and optionally COMPARE-TREE with fresh parsing."
   (let ((source (buffer-substring-no-properties (point-min) (point-max)))
         (state (sh-ts-mode-test--buffer-state))
-        (file buffer-file-name))
+        (tree (when compare-tree
+                (treesit-node-string (treesit-parser-root-node treesit-primary-parser))))
+        (file buffer-file-name)
+        (level (or level treesit-font-lock-level)))
     (with-temp-buffer
       (setq buffer-file-name file)
       (insert source)
       (let ((treesit-font-lock-level level)) (sh-ts-mode))
-      (should (equal state (sh-ts-mode-test--buffer-state))))))
+      (should (equal state (sh-ts-mode-test--buffer-state)))
+      (when compare-tree
+        (should (equal tree (treesit-node-string
+                             (treesit-parser-root-node treesit-primary-parser))))))))
 
 ;;;; Grammar
 
@@ -557,9 +580,12 @@
           (line "value=$(printf \"${1:-$?} $((2 + (3)))\")")
           (unclassified "printf \"${00}\"")
           (backquote "printf `printf \\${name}`"))
-      (insert variable "\n" line "\n" unclassified "\n" backquote "\n")
+      (insert variable "\n" line "\n" unclassified "\n" backquote "\n"
+              "echo ${#+word}\n")
       (let ((treesit-font-lock-level 4)) (sh-ts-mode))
       (font-lock-ensure)
+      (should (eq (sh-ts-mode-test--face "#+word") 'font-lock-constant-face))
+      (should (eq (sh-ts-mode-test--face "#+word" 1) 'font-lock-operator-face))
       (should (eq (sh-ts-mode-test--face "${" nil variable)
                   'font-lock-variable-use-face))
       (dolist (expectation '(("${" 1) ("}" 0)))
@@ -909,6 +935,38 @@
                   (should (treesit-node-check child 'named))
                   (should (= (treesit-node-child-count child) 0)))))))))))
 
+(ert-deftest sh-ts-mode-keeps-commands-after-closed-here-document-substitutions ()
+  (dolist (source '("x=$(cat <<EOF)\nhi\nEOF\n"
+                    "x=`cat <<EOF`\nhi\nEOF\n"))
+    (with-temp-buffer
+      (insert source)
+      (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+      (font-lock-ensure)
+      (should-not (treesit-node-check (treesit-buffer-root-node 'sh) 'has-error))
+      (dolist (command '("hi" "EOF"))
+        (should (eq (sh-ts-mode-test--face command nil command)
+                    'font-lock-function-call-face))))))
+
+(ert-deftest sh-ts-mode-highlights-declaration-words-and-their-value-context ()
+  (with-temp-buffer
+    (insert "readonly x=[a-z]* y=~\n"
+            "command export z=\"$v\"\n"
+            "command -- export q=sh\n")
+    (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+    (font-lock-ensure)
+    (sh-ts-mode-test--should-have-faces
+     '(("readonly x=[a-z]* y=~" "readonly" font-lock-function-call-face)
+       ("readonly x=[a-z]* y=~" "x" font-lock-variable-name-face)
+       ("readonly x=[a-z]* y=~" "=" font-lock-operator-face)
+       ("readonly x=[a-z]* y=~" "[" font-lock-string-face)
+       ("readonly x=[a-z]* y=~" "*" font-lock-string-face)
+       ("readonly x=[a-z]* y=~" "y=" font-lock-variable-name-face)
+       ("readonly x=[a-z]* y=~" "~" font-lock-constant-face)
+       ("command export z=\"$v\"" "export" font-lock-string-face)
+       ("command export z=\"$v\"" "z" font-lock-variable-name-face)
+       ("command export z=\"$v\"" "v" font-lock-variable-use-face)
+       ("command -- export q=sh" "q=sh" font-lock-string-face)))))
+
 ;;;; Navigation
 
 (ert-deftest sh-ts-mode-navigates-structures ()
@@ -1152,6 +1210,80 @@
 
 ;;;; Updates
 
+(ert-deftest sh-ts-mode-reparses-old-recovery-even-for-distant-edits ()
+  (pcase-dolist (`(,language ,file ,properties)
+                 '((sh "test.sh" "")))
+    (let ((treesit-font-lock-level 4))
+      (sh-ts-mode-test--with-file file properties "f() { if true; then :; }\ng() { :; }\n"
+                                  (sh-ts-mode-test--buffer-state)
+                                  (let* ((parser treesit-primary-parser)
+                                         (notifiers (treesit-parser-notifiers parser)))
+                                    (should (treesit-node-check (treesit-parser-root-node parser) 'has-error))
+                                    (treesit-parser-set-embed-level parser 3)
+                                    (goto-char (point-min))
+                                    (search-forward "g")
+                                    (save-restriction
+                                      (narrow-to-region (line-beginning-position) (line-end-position))
+                                      (insert "x"))
+                                    (should-not (eq parser treesit-primary-parser))
+                                    (should (eq (treesit-parser-language treesit-primary-parser) language))
+                                    (should (= (treesit-parser-embed-level treesit-primary-parser) 3))
+                                    (should (equal (treesit-parser-notifiers treesit-primary-parser) notifiers))
+                                    (should (equal (treesit-parser-list) (list treesit-primary-parser))))
+                                  (goto-char (point-min))
+                                  (search-forward "}")
+                                  (backward-char 1)
+                                  (insert "fi; ")
+                                  (should-not (treesit-node-check
+                                               (treesit-parser-root-node treesit-primary-parser) 'has-error))
+                                  (sh-ts-mode-test--should-match-fresh-buffer 4 t)))))
+
+(ert-deftest sh-ts-mode-refreshes-edited-owners-without-parser-notifications ()
+  (pcase-dolist (`(,language ,file ,properties ,source ,fragment ,owner-start)
+                 '((sh "test.sh" "" "f() { printf \"%s\\n\" ok; }\n" "ok" 1)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((treesit-font-lock-level 4))
+          (sh-ts-mode-test--with-file file properties source
+                                      (rename-buffer "sh-ts-mode-test" t)
+                                      (let ((noninteractive nil)) (font-lock-mode 1))
+                                      (sh-ts-mode-test--buffer-state)
+                                      (should (get-text-property owner-start 'fontified))
+                                      (let ((parser treesit-primary-parser))
+                                        (should-not (treesit-node-check (treesit-parser-root-node parser) 'has-error))
+                                        (dolist (notifier (treesit-parser-notifiers parser))
+                                          (treesit-parser-remove-notifier parser notifier))
+                                        (goto-char (sh-ts-mode-test--position fragment))
+                                        (when narrow
+                                          (narrow-to-region (line-beginning-position) (line-end-position)))
+                                        (insert "x")
+                                        (widen)
+                                        (should (eq parser treesit-primary-parser))
+                                        (should-not (get-text-property owner-start 'fontified))
+                                        (sh-ts-mode-test--should-match-fresh-buffer 4 t))))))))
+
+(ert-deftest sh-ts-mode-reparses-a-bom-moved-to-buffer-start ()
+  (pcase-dolist (`(,language ,file ,properties ,prefix ,body ,fragment ,face)
+                 '((sh "test.sh" "" "echo first\n" "# note\n" "note" font-lock-comment-face)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((treesit-font-lock-level 4))
+          (sh-ts-mode-test--with-file file properties (concat prefix "\ufeff" body)
+                                      (sh-ts-mode-test--buffer-state)
+                                      (when narrow (narrow-to-region 1 (+ 2 (length prefix))))
+                                      (delete-region 1 (1+ (length prefix)))
+                                      (widen)
+                                      (should (eq (treesit-parser-language treesit-primary-parser) language))
+                                      (should (equal (treesit-parser-list) (list treesit-primary-parser)))
+                                      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                                                     (concat "\ufeff" body)))
+                                      (sh-ts-mode-test--buffer-state)
+                                      (should-not (get-text-property 1 'face))
+                                      (goto-char (point-min))
+                                      (search-forward fragment)
+                                      (should (eq (get-text-property (1- (point)) 'face) face))
+                                      (sh-ts-mode-test--should-match-fresh-buffer 4 t)))))))
+
 (ert-deftest sh-ts-mode-refreshes-syntax-before-multiline-errors ()
   (dolist (narrow '(nil t))
     (with-temp-buffer
@@ -1174,17 +1306,20 @@
         (sh-ts-mode-test--should-match-fresh-buffer 4)
         (should (= (syntax-class (syntax-after 2)) 4))))))
 
-(ert-deftest sh-ts-mode-keeps-commands-after-closed-here-document-substitutions ()
-  (dolist (source '("x=$(cat <<EOF)\nhi\nEOF\n"
-                    "x=`cat <<EOF`\nhi\nEOF\n"))
+(ert-deftest sh-ts-mode-keeps-commands-after-here-document-eof-terminators ()
+  (dolist (source '("cat <<''\n" "cat <<-''\n\t\t" "cat <<END\nbody\nEND"))
     (with-temp-buffer
       (insert source)
       (let ((treesit-font-lock-level 4)) (sh-ts-mode))
+      (sh-ts-mode-test--buffer-state)
+      (should-not (treesit-node-check (treesit-buffer-root-node 'sh) 'has-error))
+      (goto-char (point-max))
+      (insert "\necho after\n")
       (font-lock-ensure)
       (should-not (treesit-node-check (treesit-buffer-root-node 'sh) 'has-error))
-      (dolist (command '("hi" "EOF"))
-        (should (eq (sh-ts-mode-test--face command nil command)
-                    'font-lock-function-call-face))))))
+      (should (eq (sh-ts-mode-test--face "echo") 'font-lock-function-call-face))
+      (should (eq (sh-ts-mode-test--face "after") 'font-lock-string-face))
+      (sh-ts-mode-test--should-match-fresh-buffer 4))))
 
 (ert-deftest sh-ts-mode-restores-continued-closing-keywords-after-body-repair ()
   (pcase-dolist (`(,prefix ,suffix)
@@ -1205,26 +1340,6 @@
         (should (eq (sh-ts-mode-test--face ending) 'font-lock-keyword-face))
         (should (eq (sh-ts-mode-test--face "\\") 'font-lock-punctuation-face))
         (sh-ts-mode-test--should-match-fresh-buffer 4)))))
-
-(ert-deftest sh-ts-mode-highlights-declaration-words-and-their-value-context ()
-  (with-temp-buffer
-    (insert "readonly x=[a-z]* y=~\n"
-            "command export z=\"$v\"\n"
-            "command -- export q=sh\n")
-    (let ((treesit-font-lock-level 4)) (sh-ts-mode))
-    (font-lock-ensure)
-    (sh-ts-mode-test--should-have-faces
-     '(("readonly x=[a-z]* y=~" "readonly" font-lock-function-call-face)
-       ("readonly x=[a-z]* y=~" "x" font-lock-variable-name-face)
-       ("readonly x=[a-z]* y=~" "=" font-lock-operator-face)
-       ("readonly x=[a-z]* y=~" "[" font-lock-string-face)
-       ("readonly x=[a-z]* y=~" "*" font-lock-string-face)
-       ("readonly x=[a-z]* y=~" "y=" font-lock-variable-name-face)
-       ("readonly x=[a-z]* y=~" "~" font-lock-constant-face)
-       ("command export z=\"$v\"" "export" font-lock-string-face)
-       ("command export z=\"$v\"" "z" font-lock-variable-name-face)
-       ("command export z=\"$v\"" "v" font-lock-variable-use-face)
-       ("command -- export q=sh" "q=sh" font-lock-string-face)))))
 
 (ert-deftest sh-ts-mode-reclassifies-declaration-values-after-command-edits ()
   (with-temp-buffer

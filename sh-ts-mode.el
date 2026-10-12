@@ -46,7 +46,7 @@
 
 (defconst sh-ts-mode--grammar-sources
   '((sh "https://github.com/konomanoasa/tree-sitter-sh"
-        :revision "v0.19.0"))
+        :revision "v0.20.0"))
   "Tree-sitter grammar sources for POSIX sh.")
 
 (defun sh-ts-mode--ensure-grammar (language)
@@ -58,6 +58,108 @@
                  treesit-language-source-alist))))
     (or (treesit-ensure-installed language)
         (user-error "Tree-sitter grammar `%s' is unavailable" language))))
+
+;;;; Incremental Updates
+
+(defconst sh-ts-mode-update--containers
+  '("complete_commands")
+  "Container nodes traversed to find an edited source unit.")
+
+(defvar-local sh-ts-mode-update--state nil
+  "Bounds and recovery state captured before a buffer edit.")
+
+(defvar-local sh-ts-mode-update--pending-range nil
+  "Edited owner range awaiting syntax propertization.")
+
+(defun sh-ts-mode-update--bounds (beg end)
+  "Return enclosing source-unit bounds around BEG and END."
+  (let ((start beg)
+        (finish end)
+        (root (treesit-parser-root-node treesit-primary-parser)))
+    (dolist (position (list (max (point-min) (1- beg))
+                            (min (point-max) end)))
+      (let ((node (treesit-node-at position treesit-primary-parser))
+            owner)
+        (while (and node (not (treesit-node-eq node root)))
+          (unless (member (treesit-node-type node)
+                          sh-ts-mode-update--containers)
+            (setq owner node))
+          (setq node (treesit-node-parent node)))
+        (when owner
+          (setq start (min start (treesit-node-start owner))
+                finish (max finish (treesit-node-end owner))))))
+    (cons start finish)))
+
+(defun sh-ts-mode-update--before-change (beg end)
+  "Save owner bounds and old-tree recovery state before changing BEG to END."
+  (when treesit-primary-parser
+    (save-restriction
+      (widen)
+      (setq sh-ts-mode-update--state
+            (cons (sh-ts-mode-update--bounds beg end)
+                  (treesit-node-check
+                   (treesit-parser-root-node treesit-primary-parser)
+                   'has-error))))))
+
+(defun sh-ts-mode-update--reset-parser ()
+  "Replace the primary parser without reusing its old tree."
+  (let* ((parser treesit-primary-parser)
+         (language (treesit-parser-language parser))
+         (tag (treesit-parser-tag parser))
+         (ranges (treesit-parser-included-ranges parser))
+         (notifiers (treesit-parser-notifiers parser))
+         (level (treesit-parser-embed-level parser)))
+    (treesit-parser-delete parser)
+    (setq treesit-primary-parser (treesit-parser-create language nil nil tag))
+    (treesit-parser-set-included-ranges treesit-primary-parser ranges)
+    (treesit-parser-set-embed-level treesit-primary-parser level)
+    (dolist (notifier notifiers)
+      (treesit-parser-add-notifier treesit-primary-parser notifier))))
+
+(defun sh-ts-mode-update--after-change (beg end old-length)
+  "Refresh edited owners and avoid stale trees after BEG, END and OLD-LENGTH."
+  (when treesit-primary-parser
+    (let ((narrowed (buffer-narrowed-p)))
+      (save-restriction
+        (widen)
+        (let* ((state sh-ts-mode-update--state)
+               (reset (or (cdr state)
+                          (and (= beg 1) (> old-length 0)
+                               (eq (char-after 1) #xfeff)))))
+          (setq sh-ts-mode-update--state nil)
+          (when reset (sh-ts-mode-update--reset-parser))
+          (let* ((bounds (if reset (cons (point-min) (point-max))
+                           (sh-ts-mode-update--bounds beg end)))
+                 (start (min (car bounds) (or (caar state) beg)))
+                 (finish (min (point-max)
+                              (max (cdr bounds)
+                                   (+ (or (cdar state) (+ beg old-length))
+                                      (- end beg old-length)))))
+                 (pending sh-ts-mode-update--pending-range)
+                 (pending-end (cdr pending)))
+            (when (and pending-end (>= pending-end beg))
+              (setq pending-end (max end (+ pending-end (- end beg old-length)))))
+            (setq sh-ts-mode-update--pending-range
+                  (cons (min start (or (car pending) start))
+                        (min (point-max) (max finish (or pending-end finish)))))
+            (syntax-ppss-flush-cache start)
+            (font-lock-flush start finish)
+            (when narrowed (syntax-propertize finish))))))))
+
+(defun sh-ts-mode-update--extend-region (start end)
+  "Include edited owners when propertizing START to END."
+  (when sh-ts-mode-update--pending-range
+    (let ((bounds sh-ts-mode-update--pending-range))
+      (setq sh-ts-mode-update--pending-range nil)
+      (cons (max (point-min) (min start (car bounds)))
+            (min (point-max) (max end (cdr bounds)))))))
+
+(defun sh-ts-mode-update--setup ()
+  "Configure incremental updates for the current buffer."
+  (add-hook 'before-change-functions #'sh-ts-mode-update--before-change nil t)
+  (add-hook 'after-change-functions #'sh-ts-mode-update--after-change nil t)
+  (add-hook 'syntax-propertize-extend-region-functions
+            #'sh-ts-mode-update--extend-region nil t))
 
 ;;;; Context
 
@@ -806,7 +908,8 @@ Pass ARG to `uncomment-region-default'."
   (sh-ts-mode-navigation--setup)
   (sh-ts-mode-imenu--setup)
   (sh-ts-mode-indent--setup)
-  (treesit-major-mode-setup))
+  (treesit-major-mode-setup)
+  (sh-ts-mode-update--setup))
 
 ;;;###autoload
 (define-derived-mode sh-ts-mode prog-mode "Sh-TS"
